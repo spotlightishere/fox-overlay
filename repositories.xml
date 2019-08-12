@@ -1,0 +1,13 @@
+<?xml version="1.0" ?>
+<repositories version="1.0">
+	<repo priority="50" quality="experimental" status="unofficial">
+		<name>fox-overlay</name>
+		<description>Various modifications for new software on musl.</description>
+		<homepage>https://owo.codes/spotlightishere/fox-overlay</homepage>
+    <owner>
+      <name>Spotlight</name>
+			<email>spotlight@joscomputing.space</email>
+		</owner>
+    <source type="git">https://owo.codes/spotlightishere/fox-overlay.git</source>
+	</repo>
+</repositories>
