@@ -180,7 +180,7 @@ src_compile()
 			die "go-$(gcc-major-version): command not found"
 		ln -s "${go_binary}" "${GOROOT_BOOTSTRAP}/bin/go" || die
 	elif use system-bootstrap; then
-		export GOROOT_BOOTSTRAP="${EPREFIX}"/usr/lib/go
+		export GOROOT_BOOTSTRAP="${EPREFIX}"/usr/lib/go1.4
 	fi
 	export GOROOT_FINAL="${EPREFIX}"/usr/lib/go
 	export GOROOT="$(pwd)"
