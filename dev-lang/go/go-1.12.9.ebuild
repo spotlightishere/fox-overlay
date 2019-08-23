@@ -244,6 +244,3 @@ src_install()
 		install_name_tool -id "${libmac64}" "${D}${libmac64}"
 	fi
 }
-
-
-
