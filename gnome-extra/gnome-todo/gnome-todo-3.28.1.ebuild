@@ -22,6 +22,7 @@ RDEPEND="
 	>=dev-libs/libical-0.43
 	>=dev-libs/libpeas-1.22
 	>=dev-libs/gobject-introspection-1.42:=
+	>=gnome-base/gsettings-desktop-schemas-3.28.1
 "
 DEPEND="${RDEPEND}
 	>=dev-util/meson-0.40.0
