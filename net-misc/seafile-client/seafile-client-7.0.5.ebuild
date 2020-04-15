@@ -27,17 +27,22 @@ RDEPEND="net-libs/libsearpc
 	dev-qt/qtwidgets:5
 	dev-qt/qtnetwork:5
 	dev-qt/qtdbus:5
+	sys-libs/fts-standalone
 	shibboleth? ( dev-qt/qtwebengine:5[widgets] )"
 DEPEND="${RDEPEND}
 	test? ( dev-qt/qttest:5 )"
 BDEPEND="dev-qt/linguist-tools:5"
 
-PATCHES=("${FILESDIR}/${PN}-select-qt5.patch")
+PATCHES=(
+	"${FILESDIR}/${PN}-select-qt5.patch"
+	"${FILESDIR}/libressl.patch"
+)
 
 src_configure() {
 	local mycmakeargs=(
 		-DBUILD_SHIBBOLETH_SUPPORT="$(usex shibboleth)"
 		-DBUILD_TESTING="$(usex test)"
+		-DCMAKE_CXX_FLAGS="-lfts"
 	)
 	cmake_src_configure
 }
