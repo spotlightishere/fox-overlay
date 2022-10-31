@@ -1,0 +1,42 @@
+From 212190a769721653148613ccab2378da2cb9ea66 Mon Sep 17 00:00:00 2001
+From: Spotlight <spotlight@joscomputing.space>
+Date: Mon, 31 Oct 2022 14:40:05 -0500
+Subject: [PATCH] Permit multiple pci-root controllers for mac99
+
+---
+ src/qemu/qemu_domain.c   | 2 +-
+ src/qemu/qemu_validate.c | 5 +++++
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/qemu/qemu_domain.c b/src/qemu/qemu_domain.c
+index f9fe422..6b723a9 100644
+--- a/src/qemu/qemu_domain.c
++++ b/src/qemu/qemu_domain.c
+@@ -5208,7 +5208,7 @@ qemuDomainControllerDefPostParse(virDomainControllerDef *cont,
+ 
+         /* pSeries guests can have multiple pci-root controllers,
+          * but other machine types only support a single one */
+-        if (!qemuDomainIsPSeries(def) &&
++        if (!(qemuDomainIsPSeries(def) || STREQ(def->os.machine, "mac99")) &&
+             (cont->model == VIR_DOMAIN_CONTROLLER_MODEL_PCI_ROOT ||
+              cont->model == VIR_DOMAIN_CONTROLLER_MODEL_PCIE_ROOT) &&
+             cont->idx != 0) {
+diff --git a/src/qemu/qemu_validate.c b/src/qemu/qemu_validate.c
+index 34fa10a..5af4567 100644
+--- a/src/qemu/qemu_validate.c
++++ b/src/qemu/qemu_validate.c
+@@ -3848,6 +3848,11 @@ qemuValidateDomainDeviceDefControllerPCI(const virDomainControllerDef *cont,
+ 
+     case VIR_DOMAIN_CONTROLLER_MODEL_PCI_ROOT:
+     case VIR_DOMAIN_CONTROLLER_MODEL_PCIE_ROOT:
++        /* https://gitlab.com/qemu-project/qemu/-/issues/1146 */
++        if (STREQ(def->os.machine, "mac99")) {
++            break;
++        }
++
+         /* pSeries guests can have multiple PHBs, so it's expected that
+          * the index will not be zero for some of them */
+         if (cont->model == VIR_DOMAIN_CONTROLLER_MODEL_PCI_ROOT &&
+-- 
+2.37.4
+

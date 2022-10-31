@@ -138,6 +138,7 @@ PATCHES=(
 	"${FILESDIR}"/${PN}-8.2.0-do-not-use-sysconfig.patch
 	"${FILESDIR}"/${PN}-8.2.0-fix-paths-for-apparmor.patch
 	"${FILESDIR}"/0001-Mark-mac99-as-having-a-built-in-IDE.patch
+	"${FILESDIR}"/0002-Permit-multiple-pci-root-controllers-for-mac99.patch
 )
 
 pkg_setup() {
