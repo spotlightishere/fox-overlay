@@ -21,7 +21,7 @@ if [[ ${PV} = *9999* ]]; then
 else
 	SRC_URI="https://libvirt.org/sources/${P}.tar.xz
 		verify-sig? ( https://libvirt.org/sources/${P}.tar.xz.asc )"
-	KEYWORDS="~amd64 ~arm ~arm64 ~ppc64 ~x86"
+	KEYWORDS="~amd64 ~arm64 ~ppc64 ~x86"
 fi
 
 DESCRIPTION="C toolkit to manipulate virtual machines"
@@ -60,7 +60,9 @@ BDEPEND="
 # non-optional, so put it into RDEPEND.
 # We can use both libnl:1.1 and libnl:3, but if you have both installed, the
 # package will use 3 by default. Since we don't have slot pinning in an API,
-# we must go with the most recent
+# we must go with the most recent.
+# The 'circular' dependency on dev-python/libvirt-python is because of
+# virt-qemu-qmp-proxy.
 RDEPEND="
 	acct-user/qemu
 	app-misc/scrub
@@ -107,6 +109,7 @@ RDEPEND="
 	qemu? (
 		>=app-emulation/qemu-4.2
 		>=dev-libs/yajl-2.0.3:=
+		dev-python/libvirt-python
 	)
 	rbd? ( sys-cluster/ceph )
 	sasl? ( >=dev-libs/cyrus-sasl-2.1.26 )
