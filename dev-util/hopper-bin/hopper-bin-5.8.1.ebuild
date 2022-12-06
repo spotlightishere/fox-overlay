@@ -6,13 +6,15 @@ inherit unpacker xdg
 
 DESCRIPTION="Reverse engineering tool for Intel and ARM executables (binary package)"
 HOMEPAGE="https://www.hopperapp.com"
-SRC_URI="https://d2ap6ypl1xbe4k.cloudfront.net/Hopper-v4-${PV}-Linux-demo.deb"
+# Please download the full version manually,
+# and place in /usr/portage/distfiles.
+SRC_URI="Hopper-v4-${PV}-Linux.deb"
 S="${WORKDIR}"
 
 LICENSE="all-rights-reserved"
 SLOT="0"
 KEYWORDS="~amd64"
-RESTRICT="splitdebug"
+RESTRICT="fetch splitdebug"
 
 # Mirrored from the depends listed in Debian packaging.
 RDEPEND="
@@ -37,6 +39,15 @@ QA_PREBUILT="
 	opt/hopper-v4/lib/libobjc.so.4.6
 	opt/hopper-v4/lib/libpthread_workqueue.so.0
 "
+
+pkg_nofetch() {
+	einfo "You will need to manually download this update."
+	einfo "Please move the downloaded update to DISTDIR (see /etc/portage/make.conf)."
+	einfo ""
+	einfo "If you are not clear on where to download an update from,"
+	einfo "please download the demo version, and activate your license:"
+	einfo "https://d2ap6ypl1xbe4k.cloudfront.net/Hopper-v4-${PV}-Linux-demo.deb"
+}
 
 src_prepare() {
 	default
