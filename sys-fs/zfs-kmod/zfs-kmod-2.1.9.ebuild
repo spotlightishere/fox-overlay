@@ -26,7 +26,7 @@ else
 	ZFS_KERNEL_DEP="${ZFS_KERNEL_DEP%%.*}.$(( ${ZFS_KERNEL_DEP##*.} + 1))"
 
 	if [[ ${PV} != *_rc* ]]; then
-		KEYWORDS="amd64 ~arm64 ~ppc64 ~riscv ~sparc"
+		KEYWORDS="amd64 arm64 ppc64 ~riscv ~sparc"
 	fi
 fi
 
@@ -59,6 +59,13 @@ PDEPEND="dist-kernel? ( ~sys-fs/zfs-${PV}[dist-kernel] )"
 RESTRICT="debug? ( strip ) test"
 
 DOCS=( AUTHORS COPYRIGHT META README.md )
+
+PATCHES=(
+	# Workaround for kernel 6.2.8/6.3.x support:
+	# https://github.com/openzfs/zfs/issues/14658#issuecomment-1480723155
+	"${FILESDIR}"/${PN}-2.1.9-6.3-compat.patch
+	"${FILESDIR}"/${PN}-2.1.9-blkdev-compat.patch
+)
 
 pkg_pretend() {
 	use rootfs || return 0
