@@ -21,7 +21,7 @@ if [[ ${PV} = *9999* ]]; then
 else
 	SRC_URI="https://libvirt.org/sources/${P}.tar.xz
 		verify-sig? ( https://libvirt.org/sources/${P}.tar.xz.asc )"
-	KEYWORDS="~amd64 ~arm ~arm64 ~ppc64 ~x86"
+	KEYWORDS="amd64 ~arm arm64 ~ppc64 x86"
 fi
 
 DESCRIPTION="C toolkit to manipulate virtual machines"
@@ -144,6 +144,7 @@ PATCHES=(
 	"${FILESDIR}"/${PN}-6.0.0-fix_paths_in_libvirt-guests_sh.patch
 	"${FILESDIR}"/${PN}-8.2.0-do-not-use-sysconfig.patch
 	"${FILESDIR}"/${PN}-8.2.0-fix-paths-for-apparmor.patch
+	"${FILESDIR}"/${PN}-9.2.0-meson-Stop-detecting-Wl-version-script.patch
 	"${FILESDIR}"/0001-Mark-mac99-as-having-a-built-in-IDE.patch
 	"${FILESDIR}"/0002-Permit-multiple-pci-root-controllers-for-mac99.patch
 )
