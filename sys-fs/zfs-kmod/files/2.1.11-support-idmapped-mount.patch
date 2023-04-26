@@ -1,0 +1,3203 @@
+From 259662bc5e8b234dd8f253acc8cff9083927f560 Mon Sep 17 00:00:00 2001
+From: Spotlight <spotlight@joscomputing.space>
+Date: Wed, 26 Apr 2023 12:04:02 -0500
+Subject: [PATCH 1/3] Backport "Support idmapped mount"
+
+---
+ config/kernel-idmap_mnt_api.m4            | 25 ++++++++
+ config/kernel.m4                          |  2 +
+ include/os/freebsd/spl/sys/types.h        |  2 +
+ include/os/freebsd/zfs/sys/zfs_vnops_os.h | 12 ++--
+ include/os/linux/spl/sys/cred.h           | 28 +++++++++
+ include/os/linux/spl/sys/types.h          |  3 +
+ include/os/linux/zfs/sys/policy.h         |  4 +-
+ include/os/linux/zfs/sys/zfs_vnops_os.h   | 15 +++--
+ include/os/linux/zfs/sys/zpl.h            |  2 +-
+ include/sys/zfs_acl.h                     | 11 ++--
+ module/os/freebsd/zfs/zfs_acl.c           | 30 +++++----
+ module/os/freebsd/zfs/zfs_dir.c           |  4 +-
+ module/os/freebsd/zfs/zfs_vnops_os.c      | 60 ++++++++++--------
+ module/os/freebsd/zfs/zfs_znode.c         |  4 +-
+ module/os/linux/zfs/policy.c              | 13 ++--
+ module/os/linux/zfs/zfs_acl.c             | 76 +++++++++++++---------
+ module/os/linux/zfs/zfs_dir.c             |  4 +-
+ module/os/linux/zfs/zfs_vnops_os.c        | 77 ++++++++++++++---------
+ module/os/linux/zfs/zfs_znode.c           |  2 +-
+ module/os/linux/zfs/zpl_ctldir.c          |  6 +-
+ module/os/linux/zfs/zpl_file.c            |  6 +-
+ module/os/linux/zfs/zpl_inode.c           | 62 +++++++++++++-----
+ module/os/linux/zfs/zpl_super.c           |  5 ++
+ module/os/linux/zfs/zpl_xattr.c           |  2 +-
+ module/zfs/zfs_replay.c                   | 14 ++---
+ module/zfs/zfs_vnops.c                    |  4 +-
+ 26 files changed, 312 insertions(+), 161 deletions(-)
+ create mode 100644 config/kernel-idmap_mnt_api.m4
+
+diff --git a/config/kernel-idmap_mnt_api.m4 b/config/kernel-idmap_mnt_api.m4
+new file mode 100644
+index 00000000000..47ddc5702fb
+--- /dev/null
++++ b/config/kernel-idmap_mnt_api.m4
+@@ -0,0 +1,25 @@
++dnl #
++dnl # 5.12 API
++dnl #
++dnl # Check if APIs for idmapped mount are available
++dnl #
++AC_DEFUN([ZFS_AC_KERNEL_SRC_IDMAP_MNT_API], [
++        ZFS_LINUX_TEST_SRC([idmap_mnt_api], [
++                #include <linux/fs.h>
++        ],[
++		int fs_flags = 0;
++		fs_flags |= FS_ALLOW_IDMAP;
++        ])
++])
++
++AC_DEFUN([ZFS_AC_KERNEL_IDMAP_MNT_API], [
++        AC_MSG_CHECKING([whether APIs for idmapped mount are present])
++        ZFS_LINUX_TEST_RESULT([idmap_mnt_api], [
++                AC_MSG_RESULT([yes])
++                AC_DEFINE(HAVE_IDMAP_MNT_API, 1,
++                    [APIs for idmapped mount are present])
++        ],[
++                AC_MSG_RESULT([no])
++        ])
++])
++
+diff --git a/config/kernel.m4 b/config/kernel.m4
+index 7b0c59d26d4..44f4d072501 100644
+--- a/config/kernel.m4
++++ b/config/kernel.m4
+@@ -145,6 +145,7 @@ AC_DEFUN([ZFS_AC_KERNEL_TEST_SRC], [
+ 	ZFS_AC_KERNEL_SRC_KTHREAD
+ 	ZFS_AC_KERNEL_SRC_ZERO_PAGE
+ 	ZFS_AC_KERNEL_SRC___COPY_FROM_USER_INATOMIC
++	ZFS_AC_KERNEL_SRC_IDMAP_MNT_API
+ 
+ 	AC_MSG_CHECKING([for available kernel interfaces])
+ 	ZFS_LINUX_TEST_COMPILE_ALL([kabi])
+@@ -263,6 +264,7 @@ AC_DEFUN([ZFS_AC_KERNEL_TEST_RESULT], [
+ 	ZFS_AC_KERNEL_KTHREAD
+ 	ZFS_AC_KERNEL_ZERO_PAGE
+ 	ZFS_AC_KERNEL___COPY_FROM_USER_INATOMIC
++	ZFS_AC_KERNEL_IDMAP_MNT_API
+ ])
+ 
+ dnl #
+diff --git a/include/os/freebsd/spl/sys/types.h b/include/os/freebsd/spl/sys/types.h
+index ecb91fd1bb8..6557c840feb 100644
+--- a/include/os/freebsd/spl/sys/types.h
++++ b/include/os/freebsd/spl/sys/types.h
+@@ -104,5 +104,7 @@ typedef	u_longlong_t	len_t;
+ 
+ typedef	longlong_t	diskaddr_t;
+ 
++typedef void		zuserns_t;
++
+ #include <sys/debug.h>
+ #endif	/* !_OPENSOLARIS_SYS_TYPES_H_ */
+diff --git a/include/os/freebsd/zfs/sys/zfs_vnops_os.h b/include/os/freebsd/zfs/sys/zfs_vnops_os.h
+index bf5e03b24c0..460aecd2e70 100644
+--- a/include/os/freebsd/zfs/sys/zfs_vnops_os.h
++++ b/include/os/freebsd/zfs/sys/zfs_vnops_os.h
+@@ -35,20 +35,22 @@ int dmu_read_pages(objset_t *os, uint64_t object, vm_page_t *ma, int count,
+     int *rbehind, int *rahead, int last_size);
+ extern int zfs_remove(znode_t *dzp, const char *name, cred_t *cr, int flags);
+ extern int zfs_mkdir(znode_t *dzp, const char *dirname, vattr_t *vap,
+-    znode_t **zpp, cred_t *cr, int flags, vsecattr_t *vsecp);
++    znode_t **zpp, cred_t *cr, int flags, vsecattr_t *vsecp, zuserns_t *mnt_ns);
+ extern int zfs_rmdir(znode_t *dzp, const char *name, znode_t *cwd,
+     cred_t *cr, int flags);
+-extern int zfs_setattr(znode_t *zp, vattr_t *vap, int flag, cred_t *cr);
++extern int zfs_setattr(znode_t *zp, vattr_t *vap, int flag, cred_t *cr,
++    zuserns_t *mnt_ns);
+ extern int zfs_rename(znode_t *sdzp, const char *snm, znode_t *tdzp,
+-    const char *tnm, cred_t *cr, int flags);
++    const char *tnm, cred_t *cr, int flags, zuserns_t *mnt_ns);
+ extern int zfs_symlink(znode_t *dzp, const char *name, vattr_t *vap,
+-    const char *link, znode_t **zpp, cred_t *cr, int flags);
++    const char *link, znode_t **zpp, cred_t *cr, int flags, zuserns_t *mnt_ns);
+ extern int zfs_link(znode_t *tdzp, znode_t *sp,
+     const char *name, cred_t *cr, int flags);
+ extern int zfs_space(znode_t *zp, int cmd, struct flock *bfp, int flag,
+     offset_t offset, cred_t *cr);
+ extern int zfs_create(znode_t *dzp, const char *name, vattr_t *vap, int excl,
+-    int mode, znode_t **zpp, cred_t *cr, int flag, vsecattr_t *vsecp);
++    int mode, znode_t **zpp, cred_t *cr, int flag, vsecattr_t *vsecp,
++    zuserns_t *mnt_ns);
+ extern int zfs_setsecattr(znode_t *zp, vsecattr_t *vsecp, int flag,
+     cred_t *cr);
+ extern int zfs_write_simple(znode_t *zp, const void *data, size_t len,
+diff --git a/include/os/linux/spl/sys/cred.h b/include/os/linux/spl/sys/cred.h
+index b7d3f38d70b..dc3c260dbba 100644
+--- a/include/os/linux/spl/sys/cred.h
++++ b/include/os/linux/spl/sys/cred.h
+@@ -45,6 +45,34 @@ typedef struct cred cred_t;
+ #define	SGID_TO_KGID(x)		(KGIDT_INIT(x))
+ #define	KGIDP_TO_SGIDP(x)	(&(x)->val)
+ 
++static inline uid_t zfs_uid_into_mnt(struct user_namespace *mnt_ns, uid_t uid)
++{
++	if (mnt_ns)
++		return (__kuid_val(make_kuid(mnt_ns, uid)));
++	return (uid);
++}
++
++static inline gid_t zfs_gid_into_mnt(struct user_namespace *mnt_ns, gid_t gid)
++{
++	if (mnt_ns)
++		return (__kgid_val(make_kgid(mnt_ns, gid)));
++	return (gid);
++}
++
++static inline uid_t zfs_uid_from_mnt(struct user_namespace *mnt_ns, uid_t uid)
++{
++	if (mnt_ns)
++		return (from_kuid(mnt_ns, KUIDT_INIT(uid)));
++	return (uid);
++}
++
++static inline gid_t zfs_gid_from_mnt(struct user_namespace *mnt_ns, gid_t gid)
++{
++	if (mnt_ns)
++		return (from_kgid(mnt_ns, KGIDT_INIT(gid)));
++	return (gid);
++}
++
+ extern void crhold(cred_t *cr);
+ extern void crfree(cred_t *cr);
+ extern uid_t crgetuid(const cred_t *cr);
+diff --git a/include/os/linux/spl/sys/types.h b/include/os/linux/spl/sys/types.h
+index b44c9451875..cae1bbddf10 100644
+--- a/include/os/linux/spl/sys/types.h
++++ b/include/os/linux/spl/sys/types.h
+@@ -54,4 +54,7 @@ typedef ulong_t			pgcnt_t;
+ typedef int			major_t;
+ typedef int			minor_t;
+ 
++struct user_namespace;
++typedef struct user_namespace	zuserns_t;
++
+ #endif	/* _SPL_TYPES_H */
+diff --git a/include/os/linux/zfs/sys/policy.h b/include/os/linux/zfs/sys/policy.h
+index 61afc376550..5ec51392f17 100644
+--- a/include/os/linux/zfs/sys/policy.h
++++ b/include/os/linux/zfs/sys/policy.h
+@@ -47,13 +47,13 @@ int secpolicy_vnode_create_gid(const cred_t *);
+ int secpolicy_vnode_remove(const cred_t *);
+ int secpolicy_vnode_setdac(const cred_t *, uid_t);
+ int secpolicy_vnode_setid_retain(struct znode *, const cred_t *, boolean_t);
+-int secpolicy_vnode_setids_setgids(const cred_t *, gid_t);
++int secpolicy_vnode_setids_setgids(const cred_t *, gid_t, zuserns_t *);
+ int secpolicy_zinject(const cred_t *);
+ int secpolicy_zfs(const cred_t *);
+ int secpolicy_zfs_proc(const cred_t *, proc_t *);
+ void secpolicy_setid_clear(vattr_t *, cred_t *);
+ int secpolicy_setid_setsticky_clear(struct inode *, vattr_t *,
+-    const vattr_t *, cred_t *);
++    const vattr_t *, cred_t *, zuserns_t *);
+ int secpolicy_xvattr(xvattr_t *, uid_t, cred_t *, mode_t);
+ int secpolicy_vnode_setattr(cred_t *, struct inode *, struct vattr *,
+     const struct vattr *, int, int (void *, int, cred_t *), void *);
+diff --git a/include/os/linux/zfs/sys/zfs_vnops_os.h b/include/os/linux/zfs/sys/zfs_vnops_os.h
+index 47f91e4a6cf..fcb32308562 100644
+--- a/include/os/linux/zfs/sys/zfs_vnops_os.h
++++ b/include/os/linux/zfs/sys/zfs_vnops_os.h
+@@ -45,22 +45,25 @@ extern int zfs_write_simple(znode_t *zp, const void *data, size_t len,
+ extern int zfs_lookup(znode_t *dzp, char *nm, znode_t **zpp, int flags,
+     cred_t *cr, int *direntflags, pathname_t *realpnp);
+ extern int zfs_create(znode_t *dzp, char *name, vattr_t *vap, int excl,
+-    int mode, znode_t **zpp, cred_t *cr, int flag, vsecattr_t *vsecp);
++    int mode, znode_t **zpp, cred_t *cr, int flag, vsecattr_t *vsecp,
++    zuserns_t *mnt_ns);
+ extern int zfs_tmpfile(struct inode *dip, vattr_t *vapzfs, int excl,
+-    int mode, struct inode **ipp, cred_t *cr, int flag, vsecattr_t *vsecp);
++    int mode, struct inode **ipp, cred_t *cr, int flag, vsecattr_t *vsecp,
++    zuserns_t *mnt_ns);
+ extern int zfs_remove(znode_t *dzp, char *name, cred_t *cr, int flags);
+ extern int zfs_mkdir(znode_t *dzp, char *dirname, vattr_t *vap,
+-    znode_t **zpp, cred_t *cr, int flags, vsecattr_t *vsecp);
++    znode_t **zpp, cred_t *cr, int flags, vsecattr_t *vsecp, zuserns_t *mnt_ns);
+ extern int zfs_rmdir(znode_t *dzp, char *name, znode_t *cwd,
+     cred_t *cr, int flags);
+ extern int zfs_readdir(struct inode *ip, zpl_dir_context_t *ctx, cred_t *cr);
+ extern int zfs_getattr_fast(struct user_namespace *, struct inode *ip,
+ 	struct kstat *sp);
+-extern int zfs_setattr(znode_t *zp, vattr_t *vap, int flag, cred_t *cr);
++extern int zfs_setattr(znode_t *zp, vattr_t *vap, int flag, cred_t *cr,
++    zuserns_t *mnt_ns);
+ extern int zfs_rename(znode_t *sdzp, char *snm, znode_t *tdzp,
+-    char *tnm, cred_t *cr, int flags);
++    char *tnm, cred_t *cr, int flags, zuserns_t *mnt_ns);
+ extern int zfs_symlink(znode_t *dzp, char *name, vattr_t *vap,
+-    char *link, znode_t **zpp, cred_t *cr, int flags);
++    char *link, znode_t **zpp, cred_t *cr, int flags, zuserns_t *mnt_ns);
+ extern int zfs_readlink(struct inode *ip, zfs_uio_t *uio, cred_t *cr);
+ extern int zfs_link(znode_t *tdzp, znode_t *szp,
+     char *name, cred_t *cr, int flags);
+diff --git a/include/os/linux/zfs/sys/zpl.h b/include/os/linux/zfs/sys/zpl.h
+index ac9815d4ee0..703e335c28a 100644
+--- a/include/os/linux/zfs/sys/zpl.h
++++ b/include/os/linux/zfs/sys/zpl.h
+@@ -39,7 +39,7 @@
+ 
+ /* zpl_inode.c */
+ extern void zpl_vap_init(vattr_t *vap, struct inode *dir,
+-    umode_t mode, cred_t *cr);
++    umode_t mode, cred_t *cr, zuserns_t *mnt_ns);
+ 
+ extern const struct inode_operations zpl_inode_operations;
+ extern const struct inode_operations zpl_dir_inode_operations;
+diff --git a/include/sys/zfs_acl.h b/include/sys/zfs_acl.h
+index 010686a9121..93a1f7f6172 100644
+--- a/include/sys/zfs_acl.h
++++ b/include/sys/zfs_acl.h
+@@ -206,7 +206,7 @@ struct zfsvfs;
+ 
+ #ifdef _KERNEL
+ int zfs_acl_ids_create(struct znode *, int, vattr_t *,
+-    cred_t *, vsecattr_t *, zfs_acl_ids_t *);
++    cred_t *, vsecattr_t *, zfs_acl_ids_t *, zuserns_t *);
+ void zfs_acl_ids_free(zfs_acl_ids_t *);
+ boolean_t zfs_acl_ids_overquota(struct zfsvfs *, zfs_acl_ids_t *, uint64_t);
+ int zfs_getacl(struct znode *, vsecattr_t *, boolean_t, cred_t *);
+@@ -215,15 +215,16 @@ void zfs_acl_rele(void *);
+ void zfs_oldace_byteswap(ace_t *, int);
+ void zfs_ace_byteswap(void *, size_t, boolean_t);
+ extern boolean_t zfs_has_access(struct znode *zp, cred_t *cr);
+-extern int zfs_zaccess(struct znode *, int, int, boolean_t, cred_t *);
++extern int zfs_zaccess(struct znode *, int, int, boolean_t, cred_t *,
++    zuserns_t *);
+ int zfs_fastaccesschk_execute(struct znode *, cred_t *);
+-extern int zfs_zaccess_rwx(struct znode *, mode_t, int, cred_t *);
++extern int zfs_zaccess_rwx(struct znode *, mode_t, int, cred_t *, zuserns_t *);
+ extern int zfs_zaccess_unix(struct znode *, mode_t, cred_t *);
+ extern int zfs_acl_access(struct znode *, int, cred_t *);
+ int zfs_acl_chmod_setattr(struct znode *, zfs_acl_t **, uint64_t);
+-int zfs_zaccess_delete(struct znode *, struct znode *, cred_t *);
++int zfs_zaccess_delete(struct znode *, struct znode *, cred_t *, zuserns_t *);
+ int zfs_zaccess_rename(struct znode *, struct znode *,
+-    struct znode *, struct znode *, cred_t *cr);
++    struct znode *, struct znode *, cred_t *cr, zuserns_t *mnt_ns);
+ void zfs_acl_free(zfs_acl_t *);
+ int zfs_vsec_2_aclp(struct zfsvfs *, umode_t, vsecattr_t *, cred_t *,
+     struct zfs_fuid_info **, zfs_acl_t **);
+diff --git a/module/os/freebsd/zfs/zfs_acl.c b/module/os/freebsd/zfs/zfs_acl.c
+index fe0f6913232..ca50f442a07 100644
+--- a/module/os/freebsd/zfs/zfs_acl.c
++++ b/module/os/freebsd/zfs/zfs_acl.c
+@@ -1618,7 +1618,7 @@ zfs_acl_inherit(zfsvfs_t *zfsvfs, vtype_t vtype, zfs_acl_t *paclp,
+  */
+ int
+ zfs_acl_ids_create(znode_t *dzp, int flag, vattr_t *vap, cred_t *cr,
+-    vsecattr_t *vsecp, zfs_acl_ids_t *acl_ids)
++    vsecattr_t *vsecp, zfs_acl_ids_t *acl_ids, zuserns_t *mnt_ns)
+ {
+ 	int		error;
+ 	zfsvfs_t	*zfsvfs = dzp->z_zfsvfs;
+@@ -1788,7 +1788,7 @@ zfs_getacl(znode_t *zp, vsecattr_t *vsecp, boolean_t skipaclchk, cred_t *cr)
+ 	if (mask == 0)
+ 		return (SET_ERROR(ENOSYS));
+ 
+-	if ((error = zfs_zaccess(zp, ACE_READ_ACL, 0, skipaclchk, cr)))
++	if ((error = zfs_zaccess(zp, ACE_READ_ACL, 0, skipaclchk, cr, NULL)))
+ 		return (error);
+ 
+ 	mutex_enter(&zp->z_acl_lock);
+@@ -1951,7 +1951,7 @@ zfs_setacl(znode_t *zp, vsecattr_t *vsecp, boolean_t skipaclchk, cred_t *cr)
+ 	if (zp->z_pflags & ZFS_IMMUTABLE)
+ 		return (SET_ERROR(EPERM));
+ 
+-	if ((error = zfs_zaccess(zp, ACE_WRITE_ACL, 0, skipaclchk, cr)))
++	if ((error = zfs_zaccess(zp, ACE_WRITE_ACL, 0, skipaclchk, cr, NULL)))
+ 		return (error);
+ 
+ 	error = zfs_vsec_2_aclp(zfsvfs, ZTOV(zp)->v_type, vsecp, cr, &fuidp,
+@@ -2340,7 +2340,8 @@ zfs_fastaccesschk_execute(znode_t *zdp, cred_t *cr)
+  * can define any form of access.
+  */
+ int
+-zfs_zaccess(znode_t *zp, int mode, int flags, boolean_t skipaclchk, cred_t *cr)
++zfs_zaccess(znode_t *zp, int mode, int flags, boolean_t skipaclchk, cred_t *cr,
++    zuserns_t *mnt_ns)
+ {
+ 	uint32_t	working_mode;
+ 	int		error;
+@@ -2470,9 +2471,11 @@ zfs_zaccess(znode_t *zp, int mode, int flags, boolean_t skipaclchk, cred_t *cr)
+  * NFSv4-style ZFS ACL format and call zfs_zaccess()
+  */
+ int
+-zfs_zaccess_rwx(znode_t *zp, mode_t mode, int flags, cred_t *cr)
++zfs_zaccess_rwx(znode_t *zp, mode_t mode, int flags, cred_t *cr,
++    zuserns_t *mnt_ns)
+ {
+-	return (zfs_zaccess(zp, zfs_unix_to_v4(mode >> 6), flags, B_FALSE, cr));
++	return (zfs_zaccess(zp, zfs_unix_to_v4(mode >> 6), flags, B_FALSE, cr,
++	    mnt_ns));
+ }
+ 
+ /*
+@@ -2483,7 +2486,7 @@ zfs_zaccess_unix(znode_t *zp, mode_t mode, cred_t *cr)
+ {
+ 	int v4_mode = zfs_unix_to_v4(mode >> 6);
+ 
+-	return (zfs_zaccess(zp, v4_mode, 0, B_FALSE, cr));
++	return (zfs_zaccess(zp, v4_mode, 0, B_FALSE, cr, NULL));
+ }
+ 
+ static int
+@@ -2539,7 +2542,7 @@ zfs_delete_final_check(znode_t *zp, znode_t *dzp,
+  *
+  */
+ int
+-zfs_zaccess_delete(znode_t *dzp, znode_t *zp, cred_t *cr)
++zfs_zaccess_delete(znode_t *dzp, znode_t *zp, cred_t *cr, zuserns_t *mnt_ns)
+ {
+ 	uint32_t dzp_working_mode = 0;
+ 	uint32_t zp_working_mode = 0;
+@@ -2626,7 +2629,7 @@ zfs_zaccess_delete(znode_t *dzp, znode_t *zp, cred_t *cr)
+ 
+ int
+ zfs_zaccess_rename(znode_t *sdzp, znode_t *szp, znode_t *tdzp,
+-    znode_t *tzp, cred_t *cr)
++    znode_t *tzp, cred_t *cr, zuserns_t *mnt_ns)
+ {
+ 	int add_perm;
+ 	int error;
+@@ -2646,7 +2649,8 @@ zfs_zaccess_rename(znode_t *sdzp, znode_t *szp, znode_t *tdzp,
+ 	 * to another.
+ 	 */
+ 	if (ZTOV(szp)->v_type == VDIR && ZTOV(sdzp) != ZTOV(tdzp)) {
+-		if ((error = zfs_zaccess(szp, ACE_WRITE_DATA, 0, B_FALSE, cr)))
++		if ((error = zfs_zaccess(szp, ACE_WRITE_DATA, 0, B_FALSE, cr,
++		    mnt_ns)))
+ 			return (error);
+ 	}
+ 
+@@ -2656,19 +2660,19 @@ zfs_zaccess_rename(znode_t *sdzp, znode_t *szp, znode_t *tdzp,
+ 	 * If that succeeds then check for add_file/add_subdir permissions
+ 	 */
+ 
+-	if ((error = zfs_zaccess_delete(sdzp, szp, cr)))
++	if ((error = zfs_zaccess_delete(sdzp, szp, cr, mnt_ns)))
+ 		return (error);
+ 
+ 	/*
+ 	 * If we have a tzp, see if we can delete it?
+ 	 */
+-	if (tzp && (error = zfs_zaccess_delete(tdzp, tzp, cr)))
++	if (tzp && (error = zfs_zaccess_delete(tdzp, tzp, cr, mnt_ns)))
+ 		return (error);
+ 
+ 	/*
+ 	 * Now check for add permissions
+ 	 */
+-	error = zfs_zaccess(tdzp, add_perm, 0, B_FALSE, cr);
++	error = zfs_zaccess(tdzp, add_perm, 0, B_FALSE, cr, mnt_ns);
+ 
+ 	return (error);
+ }
+diff --git a/module/os/freebsd/zfs/zfs_dir.c b/module/os/freebsd/zfs/zfs_dir.c
+index 7fff329a939..eebe34228e7 100644
+--- a/module/os/freebsd/zfs/zfs_dir.c
++++ b/module/os/freebsd/zfs/zfs_dir.c
+@@ -810,7 +810,7 @@ zfs_make_xattrdir(znode_t *zp, vattr_t *vap, znode_t **xvpp, cred_t *cr)
+ 	*xvpp = NULL;
+ 
+ 	if ((error = zfs_acl_ids_create(zp, IS_XATTR, vap, cr, NULL,
+-	    &acl_ids)) != 0)
++	    &acl_ids, NULL)) != 0)
+ 		return (error);
+ 	if (zfs_acl_ids_overquota(zfsvfs, &acl_ids, 0)) {
+ 		zfs_acl_ids_free(&acl_ids);
+@@ -956,7 +956,7 @@ zfs_sticky_remove_access(znode_t *zdp, znode_t *zp, cred_t *cr)
+ 
+ 	if ((uid = crgetuid(cr)) == downer || uid == fowner ||
+ 	    (ZTOV(zp)->v_type == VREG &&
+-	    zfs_zaccess(zp, ACE_WRITE_DATA, 0, B_FALSE, cr) == 0))
++	    zfs_zaccess(zp, ACE_WRITE_DATA, 0, B_FALSE, cr, NULL) == 0))
+ 		return (0);
+ 	else
+ 		return (secpolicy_vnode_remove(ZTOV(zp), cr));
+diff --git a/module/os/freebsd/zfs/zfs_vnops_os.c b/module/os/freebsd/zfs/zfs_vnops_os.c
+index ea6388dd515..0b7bbbdc52b 100644
+--- a/module/os/freebsd/zfs/zfs_vnops_os.c
++++ b/module/os/freebsd/zfs/zfs_vnops_os.c
+@@ -852,7 +852,7 @@ zfs_lookup(vnode_t *dvp, const char *nm, vnode_t **vpp,
+ 		/*
+ 		 * Do we have permission to get into attribute directory?
+ 		 */
+-		error = zfs_zaccess(zp, ACE_EXECUTE, 0, B_FALSE, cr);
++		error = zfs_zaccess(zp, ACE_EXECUTE, 0, B_FALSE, cr, NULL);
+ 		if (error) {
+ 			vrele(ZTOV(zp));
+ 		}
+@@ -871,7 +871,8 @@ zfs_lookup(vnode_t *dvp, const char *nm, vnode_t **vpp,
+ 			cnp->cn_flags &= ~NOEXECCHECK;
+ 		} else
+ #endif
+-		if ((error = zfs_zaccess(zdp, ACE_EXECUTE, 0, B_FALSE, cr))) {
++		if ((error = zfs_zaccess(zdp, ACE_EXECUTE, 0, B_FALSE, cr,
++		    NULL))) {
+ 			ZFS_EXIT(zfsvfs);
+ 			return (error);
+ 		}
+@@ -1047,6 +1048,7 @@ zfs_lookup(vnode_t *dvp, const char *nm, vnode_t **vpp,
+  *		flag	- large file flag [UNUSED].
+  *		ct	- caller context
+  *		vsecp	- ACL to be set
++ *		mnt_ns	- Unused on FreeBSD
+  *
+  *	OUT:	vpp	- vnode of created or trunc'd entry.
+  *
+@@ -1060,7 +1062,7 @@ zfs_lookup(vnode_t *dvp, const char *nm, vnode_t **vpp,
+ /* ARGSUSED */
+ int
+ zfs_create(znode_t *dzp, const char *name, vattr_t *vap, int excl, int mode,
+-    znode_t **zpp, cred_t *cr, int flag, vsecattr_t *vsecp)
++    znode_t **zpp, cred_t *cr, int flag, vsecattr_t *vsecp, zuserns_t *mnt_ns)
+ {
+ 	znode_t		*zp;
+ 	zfsvfs_t	*zfsvfs = dzp->z_zfsvfs;
+@@ -1122,7 +1124,7 @@ zfs_create(znode_t *dzp, const char *name, vattr_t *vap, int excl, int mode,
+ 	 * Create a new file object and update the directory
+ 	 * to reference it.
+ 	 */
+-	if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, B_FALSE, cr, mnt_ns))) {
+ 		goto out;
+ 	}
+ 
+@@ -1138,7 +1140,7 @@ zfs_create(znode_t *dzp, const char *name, vattr_t *vap, int excl, int mode,
+ 	}
+ 
+ 	if ((error = zfs_acl_ids_create(dzp, 0, vap,
+-	    cr, vsecp, &acl_ids)) != 0)
++	    cr, vsecp, &acl_ids, NULL)) != 0)
+ 		goto out;
+ 
+ 	if (S_ISREG(vap->va_mode) || S_ISDIR(vap->va_mode))
+@@ -1242,7 +1244,7 @@ zfs_remove_(vnode_t *dvp, vnode_t *vp, const char *name, cred_t *cr)
+ 	xattr_obj = 0;
+ 	xzp = NULL;
+ 
+-	if ((error = zfs_zaccess_delete(dzp, zp, cr))) {
++	if ((error = zfs_zaccess_delete(dzp, zp, cr, NULL))) {
+ 		goto out;
+ 	}
+ 
+@@ -1398,6 +1400,7 @@ zfs_remove(znode_t *dzp, const char *name, cred_t *cr, int flags)
+  *		ct	- caller context
+  *		flags	- case flags
+  *		vsecp	- ACL to be set
++ *		mnt_ns	- Unused on FreeBSD
+  *
+  *	OUT:	vpp	- vnode of created directory.
+  *
+@@ -1410,7 +1413,7 @@ zfs_remove(znode_t *dzp, const char *name, cred_t *cr, int flags)
+ /*ARGSUSED*/
+ int
+ zfs_mkdir(znode_t *dzp, const char *dirname, vattr_t *vap, znode_t **zpp,
+-    cred_t *cr, int flags, vsecattr_t *vsecp)
++    cred_t *cr, int flags, vsecattr_t *vsecp, zuserns_t *mnt_ns)
+ {
+ 	znode_t		*zp;
+ 	zfsvfs_t	*zfsvfs = dzp->z_zfsvfs;
+@@ -1458,7 +1461,7 @@ zfs_mkdir(znode_t *dzp, const char *dirname, vattr_t *vap, znode_t **zpp,
+ 	}
+ 
+ 	if ((error = zfs_acl_ids_create(dzp, 0, vap, cr,
+-	    NULL, &acl_ids)) != 0) {
++	    NULL, &acl_ids, NULL)) != 0) {
+ 		ZFS_EXIT(zfsvfs);
+ 		return (error);
+ 	}
+@@ -1479,7 +1482,8 @@ zfs_mkdir(znode_t *dzp, const char *dirname, vattr_t *vap, znode_t **zpp,
+ 	}
+ 	ASSERT3P(zp, ==, NULL);
+ 
+-	if ((error = zfs_zaccess(dzp, ACE_ADD_SUBDIRECTORY, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(dzp, ACE_ADD_SUBDIRECTORY, 0, B_FALSE, cr,
++	    mnt_ns))) {
+ 		zfs_acl_ids_free(&acl_ids);
+ 		ZFS_EXIT(zfsvfs);
+ 		return (error);
+@@ -1594,7 +1598,7 @@ zfs_rmdir_(vnode_t *dvp, vnode_t *vp, const char *name, cred_t *cr)
+ 	zilog = zfsvfs->z_log;
+ 
+ 
+-	if ((error = zfs_zaccess_delete(dzp, zp, cr))) {
++	if ((error = zfs_zaccess_delete(dzp, zp, cr, NULL))) {
+ 		goto out;
+ 	}
+ 
+@@ -2045,7 +2049,7 @@ zfs_getattr(vnode_t *vp, vattr_t *vap, int flags, cred_t *cr)
+ 	if (!(zp->z_pflags & ZFS_ACL_TRIVIAL) &&
+ 	    (vap->va_uid != crgetuid(cr))) {
+ 		if ((error = zfs_zaccess(zp, ACE_READ_ATTRIBUTES, 0,
+-		    skipaclchk, cr))) {
++		    skipaclchk, cr, NULL))) {
+ 			ZFS_EXIT(zfsvfs);
+ 			return (error);
+ 		}
+@@ -2211,7 +2215,7 @@ zfs_getattr(vnode_t *vp, vattr_t *vap, int flags, cred_t *cr)
+  *		flags	- ATTR_UTIME set if non-default time values provided.
+  *			- ATTR_NOACLCHECK (CIFS context only).
+  *		cr	- credentials of caller.
+- *		ct	- caller context
++ *		mnt_ns	- Unused on FreeBSD
+  *
+  *	RETURN:	0 on success, error code on failure.
+  *
+@@ -2220,7 +2224,7 @@ zfs_getattr(vnode_t *vp, vattr_t *vap, int flags, cred_t *cr)
+  */
+ /* ARGSUSED */
+ int
+-zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr)
++zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr, zuserns_t *mnt_ns)
+ {
+ 	vnode_t		*vp = ZTOV(zp);
+ 	zfsvfs_t	*zfsvfs = zp->z_zfsvfs;
+@@ -2392,7 +2396,7 @@ zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr)
+ 	    XVA_ISSET_REQ(xvap, XAT_CREATETIME) ||
+ 	    XVA_ISSET_REQ(xvap, XAT_SYSTEM)))) {
+ 		need_policy = zfs_zaccess(zp, ACE_WRITE_ATTRIBUTES, 0,
+-		    skipaclchk, cr);
++		    skipaclchk, cr, mnt_ns);
+ 	}
+ 
+ 	if (mask & (AT_UID|AT_GID)) {
+@@ -2429,7 +2433,7 @@ zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr)
+ 		    ((idmask == AT_UID) && take_owner) ||
+ 		    ((idmask == AT_GID) && take_group)) {
+ 			if (zfs_zaccess(zp, ACE_WRITE_OWNER, 0,
+-			    skipaclchk, cr) == 0) {
++			    skipaclchk, cr, mnt_ns) == 0) {
+ 				/*
+ 				 * Remove setuid/setgid for non-privileged users
+ 				 */
+@@ -2538,7 +2542,8 @@ zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr)
+ 	}
+ 
+ 	if (mask & AT_MODE) {
+-		if (zfs_zaccess(zp, ACE_WRITE_ACL, 0, skipaclchk, cr) == 0) {
++		if (zfs_zaccess(zp, ACE_WRITE_ACL, 0, skipaclchk, cr,
++		    mnt_ns) == 0) {
+ 			err = secpolicy_setid_setsticky_clear(vp, vap,
+ 			    &oldva, cr);
+ 			if (err) {
+@@ -3322,7 +3327,7 @@ zfs_do_rename_impl(vnode_t *sdvp, vnode_t **svpp, struct componentname *scnp,
+ 	 * Note that if target and source are the same, this can be
+ 	 * done in a single check.
+ 	 */
+-	if ((error = zfs_zaccess_rename(sdzp, szp, tdzp, tzp, cr)))
++	if ((error = zfs_zaccess_rename(sdzp, szp, tdzp, tzp, cr, NULL)))
+ 		goto out;
+ 
+ 	if ((*svpp)->v_type == VDIR) {
+@@ -3473,7 +3478,7 @@ zfs_do_rename_impl(vnode_t *sdvp, vnode_t **svpp, struct componentname *scnp,
+ 
+ int
+ zfs_rename(znode_t *sdzp, const char *sname, znode_t *tdzp, const char *tname,
+-    cred_t *cr, int flags)
++    cred_t *cr, int flags, zuserns_t *mnt_ns)
+ {
+ 	struct componentname scn, tcn;
+ 	vnode_t *sdvp, *tdvp;
+@@ -3518,6 +3523,7 @@ zfs_rename(znode_t *sdzp, const char *sname, znode_t *tdzp, const char *tname,
+  *		cr	- credentials of caller.
+  *		ct	- caller context
+  *		flags	- case flags
++ *		mnt_ns	- Unused on FreeBSD
+  *
+  *	RETURN:	0 on success, error code on failure.
+  *
+@@ -3527,7 +3533,7 @@ zfs_rename(znode_t *sdzp, const char *sname, znode_t *tdzp, const char *tname,
+ /*ARGSUSED*/
+ int
+ zfs_symlink(znode_t *dzp, const char *name, vattr_t *vap,
+-    const char *link, znode_t **zpp, cred_t *cr, int flags)
++    const char *link, znode_t **zpp, cred_t *cr, int flags, zuserns_t *mnt_ns)
+ {
+ 	znode_t		*zp;
+ 	dmu_tx_t	*tx;
+@@ -3572,7 +3578,7 @@ zfs_symlink(znode_t *dzp, const char *name, vattr_t *vap,
+ 		return (error);
+ 	}
+ 
+-	if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, B_FALSE, cr, mnt_ns))) {
+ 		zfs_acl_ids_free(&acl_ids);
+ 		ZFS_EXIT(zfsvfs);
+ 		return (error);
+@@ -3785,7 +3791,7 @@ zfs_link(znode_t *tdzp, znode_t *szp, const char *name, cred_t *cr,
+ 		return (SET_ERROR(EPERM));
+ 	}
+ 
+-	if ((error = zfs_zaccess(tdzp, ACE_ADD_FILE, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(tdzp, ACE_ADD_FILE, 0, B_FALSE, cr, NULL))) {
+ 		ZFS_EXIT(zfsvfs);
+ 		return (error);
+ 	}
+@@ -3886,7 +3892,7 @@ zfs_space(znode_t *zp, int cmd, flock64_t *bfp, int flag,
+ 	 * On Linux we can get here through truncate_range() which
+ 	 * operates directly on inodes, so we need to check access rights.
+ 	 */
+-	if ((error = zfs_zaccess(zp, ACE_WRITE_DATA, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(zp, ACE_WRITE_DATA, 0, B_FALSE, cr, NULL))) {
+ 		ZFS_EXIT(zfsvfs);
+ 		return (error);
+ 	}
+@@ -4658,8 +4664,8 @@ zfs_freebsd_create(struct vop_create_args *ap)
+ 	zfsvfs = ap->a_dvp->v_mount->mnt_data;
+ 	*ap->a_vpp = NULL;
+ 
+-	rc = zfs_create(VTOZ(ap->a_dvp), cnp->cn_nameptr, vap, !EXCL, mode,
+-	    &zp, cnp->cn_cred, 0 /* flag */, NULL /* vsecattr */);
++	rc = zfs_create(VTOZ(ap->a_dvp), cnp->cn_nameptr, vap, 0, mode,
++	    &zp, cnp->cn_cred, 0 /* flag */, NULL /* vsecattr */, NULL);
+ 	if (rc == 0)
+ 		*ap->a_vpp = ZTOV(zp);
+ 	if (zfsvfs->z_use_namecache &&
+@@ -4713,7 +4719,7 @@ zfs_freebsd_mkdir(struct vop_mkdir_args *ap)
+ 	*ap->a_vpp = NULL;
+ 
+ 	rc = zfs_mkdir(VTOZ(ap->a_dvp), ap->a_cnp->cn_nameptr, vap, &zp,
+-	    ap->a_cnp->cn_cred, 0, NULL);
++	    ap->a_cnp->cn_cred, 0, NULL, NULL);
+ 
+ 	if (rc == 0)
+ 		*ap->a_vpp = ZTOV(zp);
+@@ -4966,7 +4972,7 @@ zfs_freebsd_setattr(struct vop_setattr_args *ap)
+ 		xvap.xva_vattr.va_mask |= AT_XVATTR;
+ 		XVA_SET_REQ(&xvap, XAT_CREATETIME);
+ 	}
+-	return (zfs_setattr(VTOZ(vp), (vattr_t *)&xvap, 0, cred));
++	return (zfs_setattr(VTOZ(vp), (vattr_t *)&xvap, 0, cred, NULL));
+ }
+ 
+ #ifndef _SYS_SYSPROTO_H_
+@@ -5037,7 +5043,7 @@ zfs_freebsd_symlink(struct vop_symlink_args *ap)
+ 	*ap->a_vpp = NULL;
+ 
+ 	rc = zfs_symlink(VTOZ(ap->a_dvp), cnp->cn_nameptr, vap,
+-	    ap->a_target, &zp, cnp->cn_cred, 0 /* flags */);
++	    ap->a_target, &zp, cnp->cn_cred, 0 /* flags */, NULL);
+ 	if (rc == 0) {
+ 		*ap->a_vpp = ZTOV(zp);
+ 		ASSERT_VOP_ELOCKED(ZTOV(zp), __func__);
+diff --git a/module/os/freebsd/zfs/zfs_znode.c b/module/os/freebsd/zfs/zfs_znode.c
+index 1debc3ec3df..76c040d3797 100644
+--- a/module/os/freebsd/zfs/zfs_znode.c
++++ b/module/os/freebsd/zfs/zfs_znode.c
+@@ -296,7 +296,7 @@ zfs_create_share_dir(zfsvfs_t *zfsvfs, dmu_tx_t *tx)
+ 	sharezp->z_is_sa = zfsvfs->z_use_sa;
+ 
+ 	VERIFY0(zfs_acl_ids_create(sharezp, IS_ROOT_NODE, &vattr,
+-	    kcred, NULL, &acl_ids));
++	    kcred, NULL, &acl_ids, NULL));
+ 	zfs_mknode(sharezp, &vattr, tx, kcred, IS_ROOT_NODE, &zp, &acl_ids);
+ 	ASSERT3P(zp, ==, sharezp);
+ 	POINTER_INVALIDATE(&sharezp->z_zfsvfs);
+@@ -1772,7 +1772,7 @@ zfs_create_fs(objset_t *os, cred_t *cr, nvlist_t *zplprops, dmu_tx_t *tx)
+ 
+ 	rootzp->z_zfsvfs = zfsvfs;
+ 	VERIFY0(zfs_acl_ids_create(rootzp, IS_ROOT_NODE, &vattr,
+-	    cr, NULL, &acl_ids));
++	    cr, NULL, &acl_ids, NULL));
+ 	zfs_mknode(rootzp, &vattr, tx, cr, IS_ROOT_NODE, &zp, &acl_ids);
+ 	ASSERT3P(zp, ==, rootzp);
+ 	error = zap_add(os, moid, ZFS_ROOT_OBJ, 8, 1, &rootzp->z_id, tx);
+diff --git a/module/os/linux/zfs/policy.c b/module/os/linux/zfs/policy.c
+index 5a52092bb90..d68f3561210 100644
+--- a/module/os/linux/zfs/policy.c
++++ b/module/os/linux/zfs/policy.c
+@@ -214,8 +214,9 @@ secpolicy_vnode_setid_retain(struct znode *zp __maybe_unused, const cred_t *cr,
+  * Determine that subject can set the file setgid flag.
+  */
+ int
+-secpolicy_vnode_setids_setgids(const cred_t *cr, gid_t gid)
++secpolicy_vnode_setids_setgids(const cred_t *cr, gid_t gid, zuserns_t *mnt_ns)
+ {
++	gid = zfs_gid_into_mnt(mnt_ns, gid);
+ #if defined(CONFIG_USER_NS)
+ 	if (!kgid_has_mapping(cr->user_ns, SGID_TO_KGID(gid)))
+ 		return (EPERM);
+@@ -284,8 +285,10 @@ secpolicy_setid_clear(vattr_t *vap, cred_t *cr)
+  * Determine that subject can set the file setid flags.
+  */
+ static int
+-secpolicy_vnode_setid_modify(const cred_t *cr, uid_t owner)
++secpolicy_vnode_setid_modify(const cred_t *cr, uid_t owner, zuserns_t *mnt_ns)
+ {
++	owner = zfs_uid_into_mnt(mnt_ns, owner);
++
+ 	if (crgetuid(cr) == owner)
+ 		return (0);
+ 
+@@ -310,13 +313,13 @@ secpolicy_vnode_stky_modify(const cred_t *cr)
+ 
+ int
+ secpolicy_setid_setsticky_clear(struct inode *ip, vattr_t *vap,
+-    const vattr_t *ovap, cred_t *cr)
++    const vattr_t *ovap, cred_t *cr, zuserns_t *mnt_ns)
+ {
+ 	int error;
+ 
+ 	if ((vap->va_mode & S_ISUID) != 0 &&
+ 	    (error = secpolicy_vnode_setid_modify(cr,
+-	    ovap->va_uid)) != 0) {
++	    ovap->va_uid, mnt_ns)) != 0) {
+ 		return (error);
+ 	}
+ 
+@@ -334,7 +337,7 @@ secpolicy_setid_setsticky_clear(struct inode *ip, vattr_t *vap,
+ 	 * group-id bit.
+ 	 */
+ 	if ((vap->va_mode & S_ISGID) != 0 &&
+-	    secpolicy_vnode_setids_setgids(cr, ovap->va_gid) != 0) {
++	    secpolicy_vnode_setids_setgids(cr, ovap->va_gid, mnt_ns) != 0) {
+ 		vap->va_mode &= ~S_ISGID;
+ 	}
+ 
+diff --git a/module/os/linux/zfs/zfs_acl.c b/module/os/linux/zfs/zfs_acl.c
+index 8e96cc8e35a..fcb767e9e4a 100644
+--- a/module/os/linux/zfs/zfs_acl.c
++++ b/module/os/linux/zfs/zfs_acl.c
+@@ -1801,7 +1801,7 @@ zfs_acl_inherit(zfsvfs_t *zfsvfs, umode_t va_mode, zfs_acl_t *paclp,
+  */
+ int
+ zfs_acl_ids_create(znode_t *dzp, int flag, vattr_t *vap, cred_t *cr,
+-    vsecattr_t *vsecp, zfs_acl_ids_t *acl_ids)
++    vsecattr_t *vsecp, zfs_acl_ids_t *acl_ids, zuserns_t *mnt_ns)
+ {
+ 	int		error;
+ 	zfsvfs_t	*zfsvfs = ZTOZSB(dzp);
+@@ -1888,8 +1888,9 @@ zfs_acl_ids_create(znode_t *dzp, int flag, vattr_t *vap, cred_t *cr,
+ 		acl_ids->z_mode |= S_ISGID;
+ 	} else {
+ 		if ((acl_ids->z_mode & S_ISGID) &&
+-		    secpolicy_vnode_setids_setgids(cr, gid) != 0)
++		    secpolicy_vnode_setids_setgids(cr, gid, mnt_ns) != 0) {
+ 			acl_ids->z_mode &= ~S_ISGID;
++		}
+ 	}
+ 
+ 	if (acl_ids->z_aclp == NULL) {
+@@ -1977,7 +1978,7 @@ zfs_getacl(znode_t *zp, vsecattr_t *vsecp, boolean_t skipaclchk, cred_t *cr)
+ 	if (mask == 0)
+ 		return (SET_ERROR(ENOSYS));
+ 
+-	if ((error = zfs_zaccess(zp, ACE_READ_ACL, 0, skipaclchk, cr)))
++	if ((error = zfs_zaccess(zp, ACE_READ_ACL, 0, skipaclchk, cr, NULL)))
+ 		return (error);
+ 
+ 	mutex_enter(&zp->z_acl_lock);
+@@ -2136,7 +2137,7 @@ zfs_setacl(znode_t *zp, vsecattr_t *vsecp, boolean_t skipaclchk, cred_t *cr)
+ 	if (zp->z_pflags & ZFS_IMMUTABLE)
+ 		return (SET_ERROR(EPERM));
+ 
+-	if ((error = zfs_zaccess(zp, ACE_WRITE_ACL, 0, skipaclchk, cr)))
++	if ((error = zfs_zaccess(zp, ACE_WRITE_ACL, 0, skipaclchk, cr, NULL)))
+ 		return (error);
+ 
+ 	error = zfs_vsec_2_aclp(zfsvfs, ZTOI(zp)->i_mode, vsecp, cr, &fuidp,
+@@ -2282,7 +2283,7 @@ zfs_zaccess_dataset_check(znode_t *zp, uint32_t v4_mode)
+  */
+ static int
+ zfs_zaccess_aces_check(znode_t *zp, uint32_t *working_mode,
+-    boolean_t anyaccess, cred_t *cr)
++    boolean_t anyaccess, cred_t *cr, zuserns_t *mnt_ns)
+ {
+ 	zfsvfs_t	*zfsvfs = ZTOZSB(zp);
+ 	zfs_acl_t	*aclp;
+@@ -2298,7 +2299,13 @@ zfs_zaccess_aces_check(znode_t *zp, uint32_t *working_mode,
+ 	uid_t		gowner;
+ 	uid_t		fowner;
+ 
+-	zfs_fuid_map_ids(zp, cr, &fowner, &gowner);
++	if (mnt_ns) {
++		fowner = zfs_uid_into_mnt(mnt_ns,
++		    KUID_TO_SUID(ZTOI(zp)->i_uid));
++		gowner = zfs_gid_into_mnt(mnt_ns,
++		    KGID_TO_SGID(ZTOI(zp)->i_gid));
++	} else
++		zfs_fuid_map_ids(zp, cr, &fowner, &gowner);
+ 
+ 	mutex_enter(&zp->z_acl_lock);
+ 
+@@ -2409,7 +2416,7 @@ zfs_has_access(znode_t *zp, cred_t *cr)
+ {
+ 	uint32_t have = ACE_ALL_PERMS;
+ 
+-	if (zfs_zaccess_aces_check(zp, &have, B_TRUE, cr) != 0) {
++	if (zfs_zaccess_aces_check(zp, &have, B_TRUE, cr, NULL) != 0) {
+ 		uid_t owner;
+ 
+ 		owner = zfs_fuid_map_id(ZTOZSB(zp),
+@@ -2439,7 +2446,8 @@ zfs_has_access(znode_t *zp, cred_t *cr)
+  * we want to avoid that here.
+  */
+ static int
+-zfs_zaccess_trivial(znode_t *zp, uint32_t *working_mode, cred_t *cr)
++zfs_zaccess_trivial(znode_t *zp, uint32_t *working_mode, cred_t *cr,
++    zuserns_t *mnt_ns)
+ {
+ 	int err, mask;
+ 	int unmapped = 0;
+@@ -2453,7 +2461,10 @@ zfs_zaccess_trivial(znode_t *zp, uint32_t *working_mode, cred_t *cr)
+ 	}
+ 
+ #if defined(HAVE_IOPS_PERMISSION_USERNS)
+-	err = generic_permission(cr->user_ns, ZTOI(zp), mask);
++	if (mnt_ns)
++		err = generic_permission(mnt_ns, ZTOI(zp), mask);
++	else
++		err = generic_permission(cr->user_ns, ZTOI(zp), mask);
+ #else
+ 	err = generic_permission(ZTOI(zp), mask);
+ #endif
+@@ -2468,7 +2479,7 @@ zfs_zaccess_trivial(znode_t *zp, uint32_t *working_mode, cred_t *cr)
+ 
+ static int
+ zfs_zaccess_common(znode_t *zp, uint32_t v4_mode, uint32_t *working_mode,
+-    boolean_t *check_privs, boolean_t skipaclchk, cred_t *cr)
++    boolean_t *check_privs, boolean_t skipaclchk, cred_t *cr, zuserns_t *mnt_ns)
+ {
+ 	zfsvfs_t *zfsvfs = ZTOZSB(zp);
+ 	int err;
+@@ -2518,20 +2529,20 @@ zfs_zaccess_common(znode_t *zp, uint32_t v4_mode, uint32_t *working_mode,
+ 	}
+ 
+ 	if (zp->z_pflags & ZFS_ACL_TRIVIAL)
+-		return (zfs_zaccess_trivial(zp, working_mode, cr));
++		return (zfs_zaccess_trivial(zp, working_mode, cr, mnt_ns));
+ 
+-	return (zfs_zaccess_aces_check(zp, working_mode, B_FALSE, cr));
++	return (zfs_zaccess_aces_check(zp, working_mode, B_FALSE, cr, mnt_ns));
+ }
+ 
+ static int
+ zfs_zaccess_append(znode_t *zp, uint32_t *working_mode, boolean_t *check_privs,
+-    cred_t *cr)
++    cred_t *cr, zuserns_t *mnt_ns)
+ {
+ 	if (*working_mode != ACE_WRITE_DATA)
+ 		return (SET_ERROR(EACCES));
+ 
+ 	return (zfs_zaccess_common(zp, ACE_APPEND_DATA, working_mode,
+-	    check_privs, B_FALSE, cr));
++	    check_privs, B_FALSE, cr, mnt_ns));
+ }
+ 
+ int
+@@ -2597,7 +2608,7 @@ zfs_fastaccesschk_execute(znode_t *zdp, cred_t *cr)
+ slow:
+ 	DTRACE_PROBE(zfs__fastpath__execute__access__miss);
+ 	ZFS_ENTER(ZTOZSB(zdp));
+-	error = zfs_zaccess(zdp, ACE_EXECUTE, 0, B_FALSE, cr);
++	error = zfs_zaccess(zdp, ACE_EXECUTE, 0, B_FALSE, cr, NULL);
+ 	ZFS_EXIT(ZTOZSB(zdp));
+ 	return (error);
+ }
+@@ -2609,7 +2620,8 @@ zfs_fastaccesschk_execute(znode_t *zdp, cred_t *cr)
+  * can define any form of access.
+  */
+ int
+-zfs_zaccess(znode_t *zp, int mode, int flags, boolean_t skipaclchk, cred_t *cr)
++zfs_zaccess(znode_t *zp, int mode, int flags, boolean_t skipaclchk, cred_t *cr,
++    zuserns_t *mnt_ns)
+ {
+ 	uint32_t	working_mode;
+ 	int		error;
+@@ -2648,8 +2660,9 @@ zfs_zaccess(znode_t *zp, int mode, int flags, boolean_t skipaclchk, cred_t *cr)
+ 		}
+ 	}
+ 
+-	owner = zfs_fuid_map_id(ZTOZSB(zp), KUID_TO_SUID(ZTOI(zp)->i_uid),
+-	    cr, ZFS_OWNER);
++	owner = zfs_uid_into_mnt(mnt_ns, KUID_TO_SUID(ZTOI(zp)->i_uid));
++	owner = zfs_fuid_map_id(ZTOZSB(zp), owner, cr, ZFS_OWNER);
++
+ 	/*
+ 	 * Map the bits required to the standard inode flags
+ 	 * S_IRUSR|S_IWUSR|S_IXUSR in the needed_bits.  Map the bits
+@@ -2674,7 +2687,7 @@ zfs_zaccess(znode_t *zp, int mode, int flags, boolean_t skipaclchk, cred_t *cr)
+ 		needed_bits |= S_IXUSR;
+ 
+ 	if ((error = zfs_zaccess_common(check_zp, mode, &working_mode,
+-	    &check_privs, skipaclchk, cr)) == 0) {
++	    &check_privs, skipaclchk, cr, mnt_ns)) == 0) {
+ 		if (is_attr)
+ 			zrele(xzp);
+ 		return (secpolicy_vnode_access2(cr, ZTOI(zp), owner,
+@@ -2688,7 +2701,8 @@ zfs_zaccess(znode_t *zp, int mode, int flags, boolean_t skipaclchk, cred_t *cr)
+ 	}
+ 
+ 	if (error && (flags & V_APPEND)) {
+-		error = zfs_zaccess_append(zp, &working_mode, &check_privs, cr);
++		error = zfs_zaccess_append(zp, &working_mode, &check_privs, cr,
++		    mnt_ns);
+ 	}
+ 
+ 	if (error && check_privs) {
+@@ -2755,9 +2769,11 @@ zfs_zaccess(znode_t *zp, int mode, int flags, boolean_t skipaclchk, cred_t *cr)
+  * NFSv4-style ZFS ACL format and call zfs_zaccess()
+  */
+ int
+-zfs_zaccess_rwx(znode_t *zp, mode_t mode, int flags, cred_t *cr)
++zfs_zaccess_rwx(znode_t *zp, mode_t mode, int flags, cred_t *cr,
++    zuserns_t *mnt_ns)
+ {
+-	return (zfs_zaccess(zp, zfs_unix_to_v4(mode >> 6), flags, B_FALSE, cr));
++	return (zfs_zaccess(zp, zfs_unix_to_v4(mode >> 6), flags, B_FALSE, cr,
++	    mnt_ns));
+ }
+ 
+ /*
+@@ -2768,7 +2784,7 @@ zfs_zaccess_unix(znode_t *zp, mode_t mode, cred_t *cr)
+ {
+ 	int v4_mode = zfs_unix_to_v4(mode >> 6);
+ 
+-	return (zfs_zaccess(zp, v4_mode, 0, B_FALSE, cr));
++	return (zfs_zaccess(zp, v4_mode, 0, B_FALSE, cr, NULL));
+ }
+ 
+ /* See zfs_zaccess_delete() */
+@@ -2845,7 +2861,7 @@ int zfs_write_implies_delete_child = 1;
+  * zfs_write_implies_delete_child
+  */
+ int
+-zfs_zaccess_delete(znode_t *dzp, znode_t *zp, cred_t *cr)
++zfs_zaccess_delete(znode_t *dzp, znode_t *zp, cred_t *cr, zuserns_t *mnt_ns)
+ {
+ 	uint32_t wanted_dirperms;
+ 	uint32_t dzp_working_mode = 0;
+@@ -2872,7 +2888,7 @@ zfs_zaccess_delete(znode_t *dzp, znode_t *zp, cred_t *cr)
+ 	 * (This is part of why we're checking the target first.)
+ 	 */
+ 	zp_error = zfs_zaccess_common(zp, ACE_DELETE, &zp_working_mode,
+-	    &zpcheck_privs, B_FALSE, cr);
++	    &zpcheck_privs, B_FALSE, cr, mnt_ns);
+ 	if (zp_error == EACCES) {
+ 		/* We hit a DENY ACE. */
+ 		if (!zpcheck_privs)
+@@ -2894,7 +2910,7 @@ zfs_zaccess_delete(znode_t *dzp, znode_t *zp, cred_t *cr)
+ 	if (zfs_write_implies_delete_child)
+ 		wanted_dirperms |= ACE_WRITE_DATA;
+ 	dzp_error = zfs_zaccess_common(dzp, wanted_dirperms,
+-	    &dzp_working_mode, &dzpcheck_privs, B_FALSE, cr);
++	    &dzp_working_mode, &dzpcheck_privs, B_FALSE, cr, mnt_ns);
+ 	if (dzp_error == EACCES) {
+ 		/* We hit a DENY ACE. */
+ 		if (!dzpcheck_privs)
+@@ -2976,7 +2992,7 @@ zfs_zaccess_delete(znode_t *dzp, znode_t *zp, cred_t *cr)
+ 
+ int
+ zfs_zaccess_rename(znode_t *sdzp, znode_t *szp, znode_t *tdzp,
+-    znode_t *tzp, cred_t *cr)
++    znode_t *tzp, cred_t *cr, zuserns_t *mnt_ns)
+ {
+ 	int add_perm;
+ 	int error;
+@@ -2998,21 +3014,21 @@ zfs_zaccess_rename(znode_t *sdzp, znode_t *szp, znode_t *tdzp,
+ 	 * If that succeeds then check for add_file/add_subdir permissions
+ 	 */
+ 
+-	if ((error = zfs_zaccess_delete(sdzp, szp, cr)))
++	if ((error = zfs_zaccess_delete(sdzp, szp, cr, mnt_ns)))
+ 		return (error);
+ 
+ 	/*
+ 	 * If we have a tzp, see if we can delete it?
+ 	 */
+ 	if (tzp) {
+-		if ((error = zfs_zaccess_delete(tdzp, tzp, cr)))
++		if ((error = zfs_zaccess_delete(tdzp, tzp, cr, mnt_ns)))
+ 			return (error);
+ 	}
+ 
+ 	/*
+ 	 * Now check for add permissions
+ 	 */
+-	error = zfs_zaccess(tdzp, add_perm, 0, B_FALSE, cr);
++	error = zfs_zaccess(tdzp, add_perm, 0, B_FALSE, cr, mnt_ns);
+ 
+ 	return (error);
+ }
+diff --git a/module/os/linux/zfs/zfs_dir.c b/module/os/linux/zfs/zfs_dir.c
+index 8ad5454b5a7..9bb11d6d4c2 100644
+--- a/module/os/linux/zfs/zfs_dir.c
++++ b/module/os/linux/zfs/zfs_dir.c
+@@ -1067,7 +1067,7 @@ zfs_make_xattrdir(znode_t *zp, vattr_t *vap, znode_t **xzpp, cred_t *cr)
+ 	*xzpp = NULL;
+ 
+ 	if ((error = zfs_acl_ids_create(zp, IS_XATTR, vap, cr, NULL,
+-	    &acl_ids)) != 0)
++	    &acl_ids, NULL)) != 0)
+ 		return (error);
+ 	if (zfs_acl_ids_overquota(zfsvfs, &acl_ids, zp->z_projid)) {
+ 		zfs_acl_ids_free(&acl_ids);
+@@ -1215,7 +1215,7 @@ zfs_sticky_remove_access(znode_t *zdp, znode_t *zp, cred_t *cr)
+ 	    cr, ZFS_OWNER);
+ 
+ 	if ((uid = crgetuid(cr)) == downer || uid == fowner ||
+-	    zfs_zaccess(zp, ACE_WRITE_DATA, 0, B_FALSE, cr) == 0)
++	    zfs_zaccess(zp, ACE_WRITE_DATA, 0, B_FALSE, cr, NULL) == 0)
+ 		return (0);
+ 	else
+ 		return (secpolicy_vnode_remove(cr));
+diff --git a/module/os/linux/zfs/zfs_vnops_os.c b/module/os/linux/zfs/zfs_vnops_os.c
+index 025768fb4e7..b81b4298620 100644
+--- a/module/os/linux/zfs/zfs_vnops_os.c
++++ b/module/os/linux/zfs/zfs_vnops_os.c
+@@ -501,7 +501,7 @@ zfs_lookup(znode_t *zdp, char *nm, znode_t **zpp, int flags, cred_t *cr,
+ 		 */
+ 
+ 		if ((error = zfs_zaccess(*zpp, ACE_EXECUTE, 0,
+-		    B_TRUE, cr))) {
++		    B_TRUE, cr, NULL))) {
+ 			zrele(*zpp);
+ 			*zpp = NULL;
+ 		}
+@@ -519,7 +519,7 @@ zfs_lookup(znode_t *zdp, char *nm, znode_t **zpp, int flags, cred_t *cr,
+ 	 * Check accessibility of directory.
+ 	 */
+ 
+-	if ((error = zfs_zaccess(zdp, ACE_EXECUTE, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(zdp, ACE_EXECUTE, 0, B_FALSE, cr, NULL))) {
+ 		ZFS_EXIT(zfsvfs);
+ 		return (error);
+ 	}
+@@ -551,6 +551,7 @@ zfs_lookup(znode_t *zdp, char *nm, znode_t **zpp, int flags, cred_t *cr,
+  *		cr	- credentials of caller.
+  *		flag	- file flag.
+  *		vsecp	- ACL to be set
++ *		mnt_ns	- user namespace of the mount
+  *
+  *	OUT:	zpp	- znode of created or trunc'd entry.
+  *
+@@ -564,7 +565,8 @@ zfs_lookup(znode_t *zdp, char *nm, znode_t **zpp, int flags, cred_t *cr,
+ /* ARGSUSED */
+ int
+ zfs_create(znode_t *dzp, char *name, vattr_t *vap, int excl,
+-    int mode, znode_t **zpp, cred_t *cr, int flag, vsecattr_t *vsecp)
++    int mode, znode_t **zpp, cred_t *cr, int flag, vsecattr_t *vsecp,
++    zuserns_t *mnt_ns)
+ {
+ 	znode_t		*zp;
+ 	zfsvfs_t	*zfsvfs = ZTOZSB(dzp);
+@@ -652,7 +654,8 @@ zfs_create(znode_t *dzp, char *name, vattr_t *vap, int excl,
+ 		 * Create a new file object and update the directory
+ 		 * to reference it.
+ 		 */
+-		if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, skip_acl, cr))) {
++		if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, B_FALSE, cr,
++		    mnt_ns))) {
+ 			if (have_acl)
+ 				zfs_acl_ids_free(&acl_ids);
+ 			goto out;
+@@ -671,7 +674,7 @@ zfs_create(znode_t *dzp, char *name, vattr_t *vap, int excl,
+ 		}
+ 
+ 		if (!have_acl && (error = zfs_acl_ids_create(dzp, 0, vap,
+-		    cr, vsecp, &acl_ids)) != 0)
++		    cr, vsecp, &acl_ids, mnt_ns)) != 0)
+ 			goto out;
+ 		have_acl = B_TRUE;
+ 
+@@ -766,7 +769,8 @@ zfs_create(znode_t *dzp, char *name, vattr_t *vap, int excl,
+ 		/*
+ 		 * Verify requested access to file.
+ 		 */
+-		if (mode && (error = zfs_zaccess_rwx(zp, mode, aflags, cr))) {
++		if (mode && (error = zfs_zaccess_rwx(zp, mode, aflags, cr,
++		    mnt_ns))) {
+ 			goto out;
+ 		}
+ 
+@@ -811,7 +815,8 @@ zfs_create(znode_t *dzp, char *name, vattr_t *vap, int excl,
+ /* ARGSUSED */
+ int
+ zfs_tmpfile(struct inode *dip, vattr_t *vap, int excl,
+-    int mode, struct inode **ipp, cred_t *cr, int flag, vsecattr_t *vsecp)
++    int mode, struct inode **ipp, cred_t *cr, int flag, vsecattr_t *vsecp,
++    zuserns_t *mnt_ns)
+ {
+ 	znode_t		*zp = NULL, *dzp = ITOZ(dip);
+ 	zfsvfs_t	*zfsvfs = ITOZSB(dip);
+@@ -857,14 +862,14 @@ zfs_tmpfile(struct inode *dip, vattr_t *vap, int excl,
+ 	 * Create a new file object and update the directory
+ 	 * to reference it.
+ 	 */
+-	if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, B_FALSE, cr, mnt_ns))) {
+ 		if (have_acl)
+ 			zfs_acl_ids_free(&acl_ids);
+ 		goto out;
+ 	}
+ 
+ 	if (!have_acl && (error = zfs_acl_ids_create(dzp, 0, vap,
+-	    cr, vsecp, &acl_ids)) != 0)
++	    cr, vsecp, &acl_ids, mnt_ns)) != 0)
+ 		goto out;
+ 	have_acl = B_TRUE;
+ 
+@@ -996,7 +1001,7 @@ zfs_remove(znode_t *dzp, char *name, cred_t *cr, int flags)
+ 		return (error);
+ 	}
+ 
+-	if ((error = zfs_zaccess_delete(dzp, zp, cr))) {
++	if ((error = zfs_zaccess_delete(dzp, zp, cr, NULL))) {
+ 		goto out;
+ 	}
+ 
+@@ -1176,6 +1181,7 @@ zfs_remove(znode_t *dzp, char *name, cred_t *cr, int flags)
+  *		cr	- credentials of caller.
+  *		flags	- case flags.
+  *		vsecp	- ACL to be set
++ *		mnt_ns	- user namespace of the mount
+  *
+  *	OUT:	zpp	- znode of created directory.
+  *
+@@ -1189,7 +1195,7 @@ zfs_remove(znode_t *dzp, char *name, cred_t *cr, int flags)
+ /*ARGSUSED*/
+ int
+ zfs_mkdir(znode_t *dzp, char *dirname, vattr_t *vap, znode_t **zpp,
+-    cred_t *cr, int flags, vsecattr_t *vsecp)
++    cred_t *cr, int flags, vsecattr_t *vsecp, zuserns_t *mnt_ns)
+ {
+ 	znode_t		*zp;
+ 	zfsvfs_t	*zfsvfs = ZTOZSB(dzp);
+@@ -1246,7 +1252,7 @@ zfs_mkdir(znode_t *dzp, char *dirname, vattr_t *vap, znode_t **zpp,
+ 	}
+ 
+ 	if ((error = zfs_acl_ids_create(dzp, 0, vap, cr,
+-	    vsecp, &acl_ids)) != 0) {
++	    vsecp, &acl_ids, mnt_ns)) != 0) {
+ 		ZFS_EXIT(zfsvfs);
+ 		return (error);
+ 	}
+@@ -1267,7 +1273,8 @@ zfs_mkdir(znode_t *dzp, char *dirname, vattr_t *vap, znode_t **zpp,
+ 		return (error);
+ 	}
+ 
+-	if ((error = zfs_zaccess(dzp, ACE_ADD_SUBDIRECTORY, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(dzp, ACE_ADD_SUBDIRECTORY, 0, B_FALSE, cr,
++	    mnt_ns))) {
+ 		zfs_acl_ids_free(&acl_ids);
+ 		zfs_dirent_unlock(dl);
+ 		ZFS_EXIT(zfsvfs);
+@@ -1410,7 +1417,7 @@ zfs_rmdir(znode_t *dzp, char *name, znode_t *cwd, cred_t *cr,
+ 		return (error);
+ 	}
+ 
+-	if ((error = zfs_zaccess_delete(dzp, zp, cr))) {
++	if ((error = zfs_zaccess_delete(dzp, zp, cr, NULL))) {
+ 		goto out;
+ 	}
+ 
+@@ -1842,6 +1849,7 @@ zfs_setattr_dir(znode_t *dzp)
+  *		flags	- ATTR_UTIME set if non-default time values provided.
+  *			- ATTR_NOACLCHECK (CIFS context only).
+  *		cr	- credentials of caller.
++ *		mnt_ns	- user namespace of the mount
+  *
+  *	RETURN:	0 if success
+  *		error code if failure
+@@ -1851,7 +1859,7 @@ zfs_setattr_dir(znode_t *dzp)
+  */
+ /* ARGSUSED */
+ int
+-zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr)
++zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr, zuserns_t *mnt_ns)
+ {
+ 	struct inode	*ip;
+ 	zfsvfs_t	*zfsvfs = ZTOZSB(zp);
+@@ -2000,7 +2008,8 @@ zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr)
+ 	 */
+ 
+ 	if (mask & ATTR_SIZE) {
+-		err = zfs_zaccess(zp, ACE_WRITE_DATA, 0, skipaclchk, cr);
++		err = zfs_zaccess(zp, ACE_WRITE_DATA, 0, skipaclchk, cr,
++		    mnt_ns);
+ 		if (err)
+ 			goto out3;
+ 
+@@ -2025,13 +2034,15 @@ zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr)
+ 	    XVA_ISSET_REQ(xvap, XAT_CREATETIME) ||
+ 	    XVA_ISSET_REQ(xvap, XAT_SYSTEM)))) {
+ 		need_policy = zfs_zaccess(zp, ACE_WRITE_ATTRIBUTES, 0,
+-		    skipaclchk, cr);
++		    skipaclchk, cr, mnt_ns);
+ 	}
+ 
+ 	if (mask & (ATTR_UID|ATTR_GID)) {
+ 		int	idmask = (mask & (ATTR_UID|ATTR_GID));
+ 		int	take_owner;
+ 		int	take_group;
++		uid_t	uid;
++		gid_t	gid;
+ 
+ 		/*
+ 		 * NOTE: even if a new mode is being set,
+@@ -2045,9 +2056,13 @@ zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr)
+ 		 * Take ownership or chgrp to group we are a member of
+ 		 */
+ 
+-		take_owner = (mask & ATTR_UID) && (vap->va_uid == crgetuid(cr));
++		uid = zfs_uid_into_mnt((struct user_namespace *)mnt_ns,
++		    vap->va_uid);
++		gid = zfs_gid_into_mnt((struct user_namespace *)mnt_ns,
++		    vap->va_gid);
++		take_owner = (mask & ATTR_UID) && (uid == crgetuid(cr));
+ 		take_group = (mask & ATTR_GID) &&
+-		    zfs_groupmember(zfsvfs, vap->va_gid, cr);
++		    zfs_groupmember(zfsvfs, gid, cr);
+ 
+ 		/*
+ 		 * If both ATTR_UID and ATTR_GID are set then take_owner and
+@@ -2063,7 +2078,7 @@ zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr)
+ 		    ((idmask == ATTR_UID) && take_owner) ||
+ 		    ((idmask == ATTR_GID) && take_group)) {
+ 			if (zfs_zaccess(zp, ACE_WRITE_OWNER, 0,
+-			    skipaclchk, cr) == 0) {
++			    skipaclchk, cr, mnt_ns) == 0) {
+ 				/*
+ 				 * Remove setuid/setgid for non-privileged users
+ 				 */
+@@ -2176,12 +2191,12 @@ zfs_setattr(znode_t *zp, vattr_t *vap, int flags, cred_t *cr)
+ 	mutex_exit(&zp->z_lock);
+ 
+ 	if (mask & ATTR_MODE) {
+-		if (zfs_zaccess(zp, ACE_WRITE_ACL, 0, skipaclchk, cr) == 0) {
++		if (zfs_zaccess(zp, ACE_WRITE_ACL, 0, skipaclchk, cr,
++		    mnt_ns) == 0) {
+ 			err = secpolicy_setid_setsticky_clear(ip, vap,
+-			    &oldva, cr);
++			    &oldva, cr, mnt_ns);
+ 			if (err)
+ 				goto out3;
+-
+ 			trim_mask |= ATTR_MODE;
+ 		} else {
+ 			need_policy = TRUE;
+@@ -2672,6 +2687,7 @@ zfs_rename_lock(znode_t *szp, znode_t *tdzp, znode_t *sdzp, zfs_zlock_t **zlpp)
+  *		tnm	- New entry name.
+  *		cr	- credentials of caller.
+  *		flags	- case flags
++ *		mnt_ns	- user namespace of the mount
+  *
+  *	RETURN:	0 on success, error code on failure.
+  *
+@@ -2681,7 +2697,7 @@ zfs_rename_lock(znode_t *szp, znode_t *tdzp, znode_t *sdzp, zfs_zlock_t **zlpp)
+ /*ARGSUSED*/
+ int
+ zfs_rename(znode_t *sdzp, char *snm, znode_t *tdzp, char *tnm,
+-    cred_t *cr, int flags)
++    cred_t *cr, int flags, zuserns_t *mnt_ns)
+ {
+ 	znode_t		*szp, *tzp;
+ 	zfsvfs_t	*zfsvfs = ZTOZSB(sdzp);
+@@ -2871,7 +2887,7 @@ zfs_rename(znode_t *sdzp, char *snm, znode_t *tdzp, char *tnm,
+ 	 * done in a single check.
+ 	 */
+ 
+-	if ((error = zfs_zaccess_rename(sdzp, szp, tdzp, tzp, cr)))
++	if ((error = zfs_zaccess_rename(sdzp, szp, tdzp, tzp, cr, mnt_ns)))
+ 		goto out;
+ 
+ 	if (S_ISDIR(ZTOI(szp)->i_mode)) {
+@@ -3038,6 +3054,7 @@ zfs_rename(znode_t *sdzp, char *snm, znode_t *tdzp, char *tnm,
+  *		link	- Name for new symlink entry.
+  *		cr	- credentials of caller.
+  *		flags	- case flags
++ *		mnt_ns	- user namespace of the mount
+  *
+  *	OUT:	zpp	- Znode for new symbolic link.
+  *
+@@ -3049,7 +3066,7 @@ zfs_rename(znode_t *sdzp, char *snm, znode_t *tdzp, char *tnm,
+ /*ARGSUSED*/
+ int
+ zfs_symlink(znode_t *dzp, char *name, vattr_t *vap, char *link,
+-    znode_t **zpp, cred_t *cr, int flags)
++    znode_t **zpp, cred_t *cr, int flags, zuserns_t *mnt_ns)
+ {
+ 	znode_t		*zp;
+ 	zfs_dirlock_t	*dl;
+@@ -3087,7 +3104,7 @@ zfs_symlink(znode_t *dzp, char *name, vattr_t *vap, char *link,
+ 	}
+ 
+ 	if ((error = zfs_acl_ids_create(dzp, 0,
+-	    vap, cr, NULL, &acl_ids)) != 0) {
++	    vap, cr, NULL, &acl_ids, mnt_ns)) != 0) {
+ 		ZFS_EXIT(zfsvfs);
+ 		return (error);
+ 	}
+@@ -3104,7 +3121,7 @@ zfs_symlink(znode_t *dzp, char *name, vattr_t *vap, char *link,
+ 		return (error);
+ 	}
+ 
+-	if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(dzp, ACE_ADD_FILE, 0, B_FALSE, cr, mnt_ns))) {
+ 		zfs_acl_ids_free(&acl_ids);
+ 		zfs_dirent_unlock(dl);
+ 		ZFS_EXIT(zfsvfs);
+@@ -3354,7 +3371,7 @@ zfs_link(znode_t *tdzp, znode_t *szp, char *name, cred_t *cr,
+ 		return (SET_ERROR(EPERM));
+ 	}
+ 
+-	if ((error = zfs_zaccess(tdzp, ACE_ADD_FILE, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(tdzp, ACE_ADD_FILE, 0, B_FALSE, cr, NULL))) {
+ 		ZFS_EXIT(zfsvfs);
+ 		return (error);
+ 	}
+@@ -3942,7 +3959,7 @@ zfs_space(znode_t *zp, int cmd, flock64_t *bfp, int flag,
+ 	 * On Linux we can get here through truncate_range() which
+ 	 * operates directly on inodes, so we need to check access rights.
+ 	 */
+-	if ((error = zfs_zaccess(zp, ACE_WRITE_DATA, 0, B_FALSE, cr))) {
++	if ((error = zfs_zaccess(zp, ACE_WRITE_DATA, 0, B_FALSE, cr, NULL))) {
+ 		ZFS_EXIT(zfsvfs);
+ 		return (error);
+ 	}
+diff --git a/module/os/linux/zfs/zfs_znode.c b/module/os/linux/zfs/zfs_znode.c
+index f3475b4d979..619ef68a947 100644
+--- a/module/os/linux/zfs/zfs_znode.c
++++ b/module/os/linux/zfs/zfs_znode.c
+@@ -1947,7 +1947,7 @@ zfs_create_fs(objset_t *os, cred_t *cr, nvlist_t *zplprops, dmu_tx_t *tx)
+ 	}
+ 
+ 	VERIFY(0 == zfs_acl_ids_create(rootzp, IS_ROOT_NODE, &vattr,
+-	    cr, NULL, &acl_ids));
++	    cr, NULL, &acl_ids, NULL));
+ 	zfs_mknode(rootzp, &vattr, tx, cr, IS_ROOT_NODE, &zp, &acl_ids);
+ 	ASSERT3P(zp, ==, rootzp);
+ 	error = zap_add(os, moid, ZFS_ROOT_OBJ, 8, 1, &rootzp->z_id, tx);
+diff --git a/module/os/linux/zfs/zpl_ctldir.c b/module/os/linux/zfs/zpl_ctldir.c
+index 9b526afd000..9e7e1806f8c 100644
+--- a/module/os/linux/zfs/zpl_ctldir.c
++++ b/module/os/linux/zfs/zpl_ctldir.c
+@@ -363,7 +363,11 @@ zpl_snapdir_mkdir(struct inode *dip, struct dentry *dentry, umode_t mode)
+ 
+ 	crhold(cr);
+ 	vap = kmem_zalloc(sizeof (vattr_t), KM_SLEEP);
+-	zpl_vap_init(vap, dip, mode | S_IFDIR, cr);
++#ifdef HAVE_IOPS_MKDIR_USERNS
++	zpl_vap_init(vap, dip, mode | S_IFDIR, cr, user_ns);
++#else
++	zpl_vap_init(vap, dip, mode | S_IFDIR, cr, NULL);
++#endif
+ 
+ 	error = -zfsctl_snapdir_mkdir(dip, dname(dentry), vap, &ip, cr, 0);
+ 	if (error == 0) {
+diff --git a/module/os/linux/zfs/zpl_file.c b/module/os/linux/zfs/zpl_file.c
+index b045786f203..92babf04a92 100644
+--- a/module/os/linux/zfs/zpl_file.c
++++ b/module/os/linux/zfs/zpl_file.c
+@@ -971,7 +971,7 @@ zpl_ioctl_setflags(struct file *filp, void __user *arg)
+ 
+ 	crhold(cr);
+ 	cookie = spl_fstrans_mark();
+-	err = -zfs_setattr(ITOZ(ip), (vattr_t *)&xva, 0, cr);
++	err = -zfs_setattr(ITOZ(ip), (vattr_t *)&xva, 0, cr, NULL);
+ 	spl_fstrans_unmark(cookie);
+ 	crfree(cr);
+ 
+@@ -1019,7 +1019,7 @@ zpl_ioctl_setxattr(struct file *filp, void __user *arg)
+ 
+ 	crhold(cr);
+ 	cookie = spl_fstrans_mark();
+-	err = -zfs_setattr(ITOZ(ip), (vattr_t *)&xva, 0, cr);
++	err = -zfs_setattr(ITOZ(ip), (vattr_t *)&xva, 0, cr, NULL);
+ 	spl_fstrans_unmark(cookie);
+ 	crfree(cr);
+ 
+@@ -1107,7 +1107,7 @@ zpl_ioctl_setdosflags(struct file *filp, void __user *arg)
+ 
+ 	crhold(cr);
+ 	cookie = spl_fstrans_mark();
+-	err = -zfs_setattr(ITOZ(ip), (vattr_t *)&xva, 0, cr);
++	err = -zfs_setattr(ITOZ(ip), (vattr_t *)&xva, 0, cr, NULL);
+ 	spl_fstrans_unmark(cookie);
+ 	crfree(cr);
+ 
+diff --git a/module/os/linux/zfs/zpl_inode.c b/module/os/linux/zfs/zpl_inode.c
+index dd634f70eb7..d218045d11c 100644
+--- a/module/os/linux/zfs/zpl_inode.c
++++ b/module/os/linux/zfs/zpl_inode.c
+@@ -33,7 +33,6 @@
+ #include <sys/zpl.h>
+ #include <sys/file.h>
+ 
+-
+ static struct dentry *
+ zpl_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
+ {
+@@ -112,18 +111,22 @@ zpl_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
+ }
+ 
+ void
+-zpl_vap_init(vattr_t *vap, struct inode *dir, umode_t mode, cred_t *cr)
++zpl_vap_init(vattr_t *vap, struct inode *dir, umode_t mode, cred_t *cr,
++    zuserns_t *mnt_ns)
+ {
+ 	vap->va_mask = ATTR_MODE;
+ 	vap->va_mode = mode;
+-	vap->va_uid = crgetuid(cr);
++
++	vap->va_uid = zfs_uid_from_mnt((struct user_namespace *)mnt_ns,
++	    crgetuid(cr));
+ 
+ 	if (dir && dir->i_mode & S_ISGID) {
+ 		vap->va_gid = KGID_TO_SGID(dir->i_gid);
+ 		if (S_ISDIR(mode))
+ 			vap->va_mode |= S_ISGID;
+ 	} else {
+-		vap->va_gid = crgetgid(cr);
++		vap->va_gid = zfs_gid_from_mnt((struct user_namespace *)mnt_ns,
++		    crgetgid(cr));
+ 	}
+ }
+ 
+@@ -140,14 +143,17 @@ zpl_create(struct inode *dir, struct dentry *dentry, umode_t mode, bool flag)
+ 	vattr_t *vap;
+ 	int error;
+ 	fstrans_cookie_t cookie;
++#ifndef HAVE_IOPS_CREATE_USERNS
++	zuserns_t *user_ns = NULL;
++#endif
+ 
+ 	crhold(cr);
+ 	vap = kmem_zalloc(sizeof (vattr_t), KM_SLEEP);
+-	zpl_vap_init(vap, dir, mode, cr);
++	zpl_vap_init(vap, dir, mode, cr, user_ns);
+ 
+ 	cookie = spl_fstrans_mark();
+ 	error = -zfs_create(ITOZ(dir), dname(dentry), vap, 0,
+-	    mode, &zp, cr, 0, NULL);
++	    mode, &zp, cr, 0, NULL, user_ns);
+ 	if (error == 0) {
+ 		error = zpl_xattr_security_init(ZTOI(zp), dir, &dentry->d_name);
+ 		if (error == 0)
+@@ -184,6 +190,9 @@ zpl_mknod(struct inode *dir, struct dentry *dentry, umode_t mode,
+ 	vattr_t *vap;
+ 	int error;
+ 	fstrans_cookie_t cookie;
++#ifndef HAVE_IOPS_MKNOD_USERNS
++	zuserns_t *user_ns = NULL;
++#endif
+ 
+ 	/*
+ 	 * We currently expect Linux to supply rdev=0 for all sockets
+@@ -194,12 +203,12 @@ zpl_mknod(struct inode *dir, struct dentry *dentry, umode_t mode,
+ 
+ 	crhold(cr);
+ 	vap = kmem_zalloc(sizeof (vattr_t), KM_SLEEP);
+-	zpl_vap_init(vap, dir, mode, cr);
++	zpl_vap_init(vap, dir, mode, cr, user_ns);
+ 	vap->va_rdev = rdev;
+ 
+ 	cookie = spl_fstrans_mark();
+ 	error = -zfs_create(ITOZ(dir), dname(dentry), vap, 0,
+-	    mode, &zp, cr, 0, NULL);
++	    mode, &zp, cr, 0, NULL, user_ns);
+ 	if (error == 0) {
+ 		error = zpl_xattr_security_init(ZTOI(zp), dir, &dentry->d_name);
+ 		if (error == 0)
+@@ -241,6 +250,9 @@ zpl_tmpfile(struct inode *dir, struct dentry *dentry, umode_t mode)
+ 	vattr_t *vap;
+ 	int error;
+ 	fstrans_cookie_t cookie;
++#ifndef HAVE_TMPFILE_USERNS
++	zuserns_t *userns = NULL;
++#endif
+ 
+ 	crhold(cr);
+ 	vap = kmem_zalloc(sizeof (vattr_t), KM_SLEEP);
+@@ -250,10 +262,10 @@ zpl_tmpfile(struct inode *dir, struct dentry *dentry, umode_t mode)
+ 	 */
+ 	if (!IS_POSIXACL(dir))
+ 		mode &= ~current_umask();
+-	zpl_vap_init(vap, dir, mode, cr);
++	zpl_vap_init(vap, dir, mode, cr, userns);
+ 
+ 	cookie = spl_fstrans_mark();
+-	error = -zfs_tmpfile(dir, vap, 0, mode, &ip, cr, 0, NULL);
++	error = -zfs_tmpfile(dir, vap, 0, mode, &ip, cr, 0, NULL, userns);
+ 	if (error == 0) {
+ 		/* d_tmpfile will do drop_nlink, so we should set it first */
+ 		set_nlink(ip, 1);
+@@ -326,13 +338,17 @@ zpl_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+ 	znode_t *zp;
+ 	int error;
+ 	fstrans_cookie_t cookie;
++#ifndef HAVE_IOPS_MKDIR_USERNS
++	zuserns_t *user_ns = NULL;
++#endif
+ 
+ 	crhold(cr);
+ 	vap = kmem_zalloc(sizeof (vattr_t), KM_SLEEP);
+-	zpl_vap_init(vap, dir, mode | S_IFDIR, cr);
++	zpl_vap_init(vap, dir, mode | S_IFDIR, cr, user_ns);
+ 
+ 	cookie = spl_fstrans_mark();
+-	error = -zfs_mkdir(ITOZ(dir), dname(dentry), vap, &zp, cr, 0, NULL);
++	error = -zfs_mkdir(ITOZ(dir), dname(dentry), vap, &zp, cr, 0, NULL,
++	    user_ns);
+ 	if (error == 0) {
+ 		error = zpl_xattr_security_init(ZTOI(zp), dir, &dentry->d_name);
+ 		if (error == 0)
+@@ -454,7 +470,11 @@ zpl_setattr(struct dentry *dentry, struct iattr *ia)
+ 	int error;
+ 	fstrans_cookie_t cookie;
+ 
++#ifdef HAVE_SETATTR_PREPARE_USERNS
++	error = zpl_setattr_prepare(user_ns, dentry, ia);
++#else
+ 	error = zpl_setattr_prepare(kcred->user_ns, dentry, ia);
++#endif
+ 	if (error)
+ 		return (error);
+ 
+@@ -473,7 +493,11 @@ zpl_setattr(struct dentry *dentry, struct iattr *ia)
+ 		ip->i_atime = zpl_inode_timestamp_truncate(ia->ia_atime, ip);
+ 
+ 	cookie = spl_fstrans_mark();
+-	error = -zfs_setattr(ITOZ(ip), vap, 0, cr);
++#ifdef HAVE_SETATTR_PREPARE_USERNS
++	error = -zfs_setattr(ITOZ(ip), vap, 0, cr, user_ns);
++#else
++	error = -zfs_setattr(ITOZ(ip), vap, 0, cr, NULL);
++#endif
+ 	if (!error && (ia->ia_valid & ATTR_MODE))
+ 		error = zpl_chmod_acl(ip);
+ 
+@@ -498,6 +522,9 @@ zpl_rename2(struct inode *sdip, struct dentry *sdentry,
+ 	cred_t *cr = CRED();
+ 	int error;
+ 	fstrans_cookie_t cookie;
++#ifndef HAVE_IOPS_RENAME_USERNS
++	zuserns_t *user_ns = NULL;
++#endif
+ 
+ 	/* We don't have renameat2(2) support */
+ 	if (flags)
+@@ -506,7 +533,7 @@ zpl_rename2(struct inode *sdip, struct dentry *sdentry,
+ 	crhold(cr);
+ 	cookie = spl_fstrans_mark();
+ 	error = -zfs_rename(ITOZ(sdip), dname(sdentry), ITOZ(tdip),
+-	    dname(tdentry), cr, 0);
++	    dname(tdentry), cr, 0, user_ns);
+ 	spl_fstrans_unmark(cookie);
+ 	crfree(cr);
+ 	ASSERT3S(error, <=, 0);
+@@ -536,14 +563,17 @@ zpl_symlink(struct inode *dir, struct dentry *dentry, const char *name)
+ 	znode_t *zp;
+ 	int error;
+ 	fstrans_cookie_t cookie;
++#ifndef HAVE_IOPS_SYMLINK_USERNS
++	zuserns_t *user_ns = NULL;
++#endif
+ 
+ 	crhold(cr);
+ 	vap = kmem_zalloc(sizeof (vattr_t), KM_SLEEP);
+-	zpl_vap_init(vap, dir, S_IFLNK | S_IRWXUGO, cr);
++	zpl_vap_init(vap, dir, S_IFLNK | S_IRWXUGO, cr, user_ns);
+ 
+ 	cookie = spl_fstrans_mark();
+ 	error = -zfs_symlink(ITOZ(dir), dname(dentry), vap,
+-	    (char *)name, &zp, cr, 0);
++	    (char *)name, &zp, cr, 0, user_ns);
+ 	if (error == 0) {
+ 		error = zpl_xattr_security_init(ZTOI(zp), dir, &dentry->d_name);
+ 		if (error) {
+diff --git a/module/os/linux/zfs/zpl_super.c b/module/os/linux/zfs/zpl_super.c
+index c2fd3fee140..21db088942b 100644
+--- a/module/os/linux/zfs/zpl_super.c
++++ b/module/os/linux/zfs/zpl_super.c
+@@ -360,6 +360,11 @@ const struct super_operations zpl_super_operations = {
+ struct file_system_type zpl_fs_type = {
+ 	.owner			= THIS_MODULE,
+ 	.name			= ZFS_DRIVER,
++#if defined(HAVE_IDMAP_MNT_API)
++	.fs_flags		= FS_USERNS_MOUNT | FS_ALLOW_IDMAP,
++#else
++	.fs_flags		= FS_USERNS_MOUNT,
++#endif
+ 	.mount			= zpl_mount,
+ 	.kill_sb		= zpl_kill_sb,
+ };
+diff --git a/module/os/linux/zfs/zpl_xattr.c b/module/os/linux/zfs/zpl_xattr.c
+index 364cd34c163..5f0be5f6418 100644
+--- a/module/os/linux/zfs/zpl_xattr.c
++++ b/module/os/linux/zfs/zpl_xattr.c
+@@ -496,7 +496,7 @@ zpl_xattr_set_dir(struct inode *ip, const char *name, const void *value,
+ 		vap->va_gid = crgetgid(cr);
+ 
+ 		error = -zfs_create(dxzp, (char *)name, vap, 0, 0644, &xzp,
+-		    cr, ATTR_NOACLCHECK, NULL);
++		    cr, 0, NULL, NULL);
+ 		if (error)
+ 			goto out;
+ 	}
+diff --git a/module/zfs/zfs_replay.c b/module/zfs/zfs_replay.c
+index f3d209f1fbd..c7a3486cd36 100644
+--- a/module/zfs/zfs_replay.c
++++ b/module/zfs/zfs_replay.c
+@@ -385,7 +385,7 @@ zfs_replay_create_acl(void *arg1, void *arg2, boolean_t byteswap)
+ 		}
+ 
+ 		error = zfs_create(dzp, name, &xva.xva_vattr,
+-		    0, 0, &zp, kcred, vflg, &vsec);
++		    0, 0, &zp, kcred, vflg, &vsec, NULL);
+ 		break;
+ 	case TX_MKDIR_ACL:
+ 		aclstart = (caddr_t)(lracl + 1);
+@@ -415,7 +415,7 @@ zfs_replay_create_acl(void *arg1, void *arg2, boolean_t byteswap)
+ 			    lr->lr_uid, lr->lr_gid);
+ 		}
+ 		error = zfs_mkdir(dzp, name, &xva.xva_vattr,
+-		    &zp, kcred, vflg, &vsec);
++		    &zp, kcred, vflg, &vsec, NULL);
+ 		break;
+ 	default:
+ 		error = SET_ERROR(ENOTSUP);
+@@ -525,7 +525,7 @@ zfs_replay_create(void *arg1, void *arg2, boolean_t byteswap)
+ 			name = (char *)start;
+ 
+ 		error = zfs_create(dzp, name, &xva.xva_vattr,
+-		    0, 0, &zp, kcred, vflg, NULL);
++		    0, 0, &zp, kcred, vflg, NULL, NULL);
+ 		break;
+ 	case TX_MKDIR_ATTR:
+ 		lrattr = (lr_attr_t *)(caddr_t)(lr + 1);
+@@ -542,7 +542,7 @@ zfs_replay_create(void *arg1, void *arg2, boolean_t byteswap)
+ 			name = (char *)(lr + 1);
+ 
+ 		error = zfs_mkdir(dzp, name, &xva.xva_vattr,
+-		    &zp, kcred, vflg, NULL);
++		    &zp, kcred, vflg, NULL, NULL);
+ 		break;
+ 	case TX_MKXATTR:
+ 		error = zfs_make_xattrdir(dzp, &xva.xva_vattr, &zp, kcred);
+@@ -551,7 +551,7 @@ zfs_replay_create(void *arg1, void *arg2, boolean_t byteswap)
+ 		name = (char *)(lr + 1);
+ 		link = name + strlen(name) + 1;
+ 		error = zfs_symlink(dzp, name, &xva.xva_vattr,
+-		    link, &zp, kcred, vflg);
++		    link, &zp, kcred, vflg, NULL);
+ 		break;
+ 	default:
+ 		error = SET_ERROR(ENOTSUP);
+@@ -663,7 +663,7 @@ zfs_replay_rename(void *arg1, void *arg2, boolean_t byteswap)
+ 	if (lr->lr_common.lrc_txtype & TX_CI)
+ 		vflg |= FIGNORECASE;
+ 
+-	error = zfs_rename(sdzp, sname, tdzp, tname, kcred, vflg);
++	error = zfs_rename(sdzp, sname, tdzp, tname, kcred, vflg, NULL);
+ 
+ 	zrele(tdzp);
+ 	zrele(sdzp);
+@@ -857,7 +857,7 @@ zfs_replay_setattr(void *arg1, void *arg2, boolean_t byteswap)
+ 	zfsvfs->z_fuid_replay = zfs_replay_fuid_domain(start, &start,
+ 	    lr->lr_uid, lr->lr_gid);
+ 
+-	error = zfs_setattr(zp, vap, 0, kcred);
++	error = zfs_setattr(zp, vap, 0, kcred, NULL);
+ 
+ 	zfs_fuid_info_free(zfsvfs->z_fuid_replay);
+ 	zfsvfs->z_fuid_replay = NULL;
+diff --git a/module/zfs/zfs_vnops.c b/module/zfs/zfs_vnops.c
+index b9498d17ee2..6d74ffb633c 100644
+--- a/module/zfs/zfs_vnops.c
++++ b/module/zfs/zfs_vnops.c
+@@ -165,9 +165,9 @@ zfs_access(znode_t *zp, int mode, int flag, cred_t *cr)
+ 	ZFS_VERIFY_ZP(zp);
+ 
+ 	if (flag & V_ACE_MASK)
+-		error = zfs_zaccess(zp, mode, flag, B_FALSE, cr);
++		error = zfs_zaccess(zp, mode, flag, B_FALSE, cr, NULL);
+ 	else
+-		error = zfs_zaccess_rwx(zp, mode, flag, cr);
++		error = zfs_zaccess_rwx(zp, mode, flag, cr, NULL);
+ 
+ 	ZFS_EXIT(zfsvfs);
+ 	return (error);
+
+From 99435ad33fdffdcf710255c7ed25eea3a3e21a4b Mon Sep 17 00:00:00 2001
+From: Spotlight <spotlight@joscomputing.space>
+Date: Wed, 26 Apr 2023 12:11:02 -0500
+Subject: [PATCH 2/3] Backport "Add tests for idmapped mount functionality"
+
+---
+ tests/runfiles/linux.run                      |   5 +
+ tests/zfs-tests/cmd/Makefile.am               |   1 +
+ tests/zfs-tests/cmd/idmap_util/.gitignore     |   1 +
+ tests/zfs-tests/cmd/idmap_util/Makefile.am    |   9 +
+ tests/zfs-tests/cmd/idmap_util/idmap_util.c   | 791 ++++++++++++++++++
+ tests/zfs-tests/include/commands.cfg          |   2 +-
+ .../tests/functional/idmap_mount/cleanup.ksh  |  25 +
+ .../functional/idmap_mount/idmap_mount.cfg    |  25 +
+ .../idmap_mount/idmap_mount_001.ksh           |  76 ++
+ .../idmap_mount/idmap_mount_002.ksh           |  97 +++
+ .../idmap_mount/idmap_mount_003.ksh           | 121 +++
+ .../idmap_mount/idmap_mount_004.ksh           | 106 +++
+ .../idmap_mount/idmap_mount_common.kshlib     |  23 +
+ .../tests/functional/idmap_mount/setup.ksh    |  30 +
+ 14 files changed, 1311 insertions(+), 1 deletion(-)
+ create mode 100644 tests/zfs-tests/cmd/idmap_util/.gitignore
+ create mode 100644 tests/zfs-tests/cmd/idmap_util/Makefile.am
+ create mode 100644 tests/zfs-tests/cmd/idmap_util/idmap_util.c
+ create mode 100755 tests/zfs-tests/tests/functional/idmap_mount/cleanup.ksh
+ create mode 100644 tests/zfs-tests/tests/functional/idmap_mount/idmap_mount.cfg
+ create mode 100755 tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_001.ksh
+ create mode 100755 tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_002.ksh
+ create mode 100755 tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_003.ksh
+ create mode 100755 tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_004.ksh
+ create mode 100644 tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_common.kshlib
+ create mode 100755 tests/zfs-tests/tests/functional/idmap_mount/setup.ksh
+
+diff --git a/tests/runfiles/linux.run b/tests/runfiles/linux.run
+index a94472d1261..211e6a1dd41 100644
+--- a/tests/runfiles/linux.run
++++ b/tests/runfiles/linux.run
+@@ -188,3 +188,8 @@ tags = ['functional', 'user_namespace']
+ tests = ['groupspace_001_pos', 'groupspace_002_pos', 'groupspace_003_pos',
+     'userquota_013_pos', 'userspace_003_pos']
+ tags = ['functional', 'userquota']
++
++[tests/functional/idmap_mount:Linux]
++tests = ['idmap_mount_001', 'idmap_mount_002', 'idmap_mount_003',
++    'idmap_mount_004']
++tags = ['functional', 'idmap_mount']
+diff --git a/tests/zfs-tests/cmd/Makefile.am b/tests/zfs-tests/cmd/Makefile.am
+index 7202e00711d..4bd6747a81d 100644
+--- a/tests/zfs-tests/cmd/Makefile.am
++++ b/tests/zfs-tests/cmd/Makefile.am
+@@ -32,6 +32,7 @@ SUBDIRS = \
+ 
+ if BUILD_LINUX
+ SUBDIRS += \
++	idmap_util \
+ 	randfree_file \
+ 	read_dos_attributes \
+ 	user_ns_exec \
+diff --git a/tests/zfs-tests/cmd/idmap_util/.gitignore b/tests/zfs-tests/cmd/idmap_util/.gitignore
+new file mode 100644
+index 00000000000..37982f07a5e
+--- /dev/null
++++ b/tests/zfs-tests/cmd/idmap_util/.gitignore
+@@ -0,0 +1 @@
++/idmap_util
+diff --git a/tests/zfs-tests/cmd/idmap_util/Makefile.am b/tests/zfs-tests/cmd/idmap_util/Makefile.am
+new file mode 100644
+index 00000000000..38b62eb0272
+--- /dev/null
++++ b/tests/zfs-tests/cmd/idmap_util/Makefile.am
+@@ -0,0 +1,9 @@
++include $(top_srcdir)/config/Rules.am
++
++pkgexecdir = $(datadir)/@PACKAGE@/zfs-tests/bin
++
++pkgexec_PROGRAMS = idmap_util
++
++idmap_util_SOURCES = idmap_util.c
++idmap_util_LDADD = \
++	$(abs_top_builddir)/lib/libspl/libspl.la
+diff --git a/tests/zfs-tests/cmd/idmap_util/idmap_util.c b/tests/zfs-tests/cmd/idmap_util/idmap_util.c
+new file mode 100644
+index 00000000000..a9731f00dbc
+--- /dev/null
++++ b/tests/zfs-tests/cmd/idmap_util/idmap_util.c
+@@ -0,0 +1,791 @@
++/*
++ * CDDL HEADER START
++ *
++ * The contents of this file are subject to the terms of the
++ * Common Development and Distribution License (the "License").
++ * You may not use this file except in compliance with the License.
++ *
++ * You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++ * or https://opensource.org/licenses/CDDL-1.0.
++ * See the License for the specific language governing permissions
++ * and limitations under the License.
++ *
++ * When distributing Covered Code, include this CDDL HEADER in each
++ * file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++ * If applicable, add the following below this CDDL HEADER, with the
++ * fields enclosed by brackets "[]" replaced with your own identifying
++ * information: Portions Copyright [yyyy] [name of copyright owner]
++ *
++ * CDDL HEADER END
++ */
++
++#ifndef _GNU_SOURCE
++#define	_GNU_SOURCE
++#endif
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <string.h>
++#include <linux/types.h>
++#include <sys/wait.h>
++#include <sys/stat.h>
++#include <sys/mount.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <sched.h>
++#include <syscall.h>
++
++#include <sys/list.h>
++
++#ifndef UINT_MAX
++#define	UINT_MAX	4294967295U
++#endif
++
++#ifndef __NR_Linux
++#if defined __alpha__
++#define	__NR_Linux 110
++#elif defined _MIPS_SIM
++#if _MIPS_SIM == _MIPS_SIM_ABI32
++#define	__NR_Linux 4000
++#endif
++#if _MIPS_SIM == _MIPS_SIM_NABI32
++#define	__NR_Linux 6000
++#endif
++#if _MIPS_SIM == _MIPS_SIM_ABI64
++#define	__NR_Linux 5000
++#endif
++#elif defined __ia64__
++#define	__NR_Linux 1024
++#else
++#define	__NR_Linux 0
++#endif
++#endif
++
++#ifndef __NR_mount_setattr
++#define	__NR_mount_setattr (442 + __NR_Linux)
++#endif
++
++#ifndef __NR_open_tree
++#define	__NR_open_tree (428 + __NR_Linux)
++#endif
++
++#ifndef __NR_move_mount
++#define	__NR_move_mount (429 + __NR_Linux)
++#endif
++
++#ifndef MNT_DETACH
++#define	MNT_DETACH 2
++#endif
++
++#ifndef MOVE_MOUNT_F_EMPTY_PATH
++#define	MOVE_MOUNT_F_EMPTY_PATH 0x00000004
++#endif
++
++#ifndef MOUNT_ATTR_IDMAP
++#define	MOUNT_ATTR_IDMAP 0x00100000
++#endif
++
++#ifndef OPEN_TREE_CLONE
++#define	OPEN_TREE_CLONE 1
++#endif
++
++#ifndef OPEN_TREE_CLOEXEC
++#define	OPEN_TREE_CLOEXEC O_CLOEXEC
++#endif
++
++#ifndef AT_RECURSIVE
++#define	AT_RECURSIVE 0x8000
++#endif
++
++#ifndef mount_attr
++struct mount_attr {
++	__u64 attr_set;
++	__u64 attr_clr;
++	__u64 propagation;
++	__u64 userns_fd;
++};
++#endif
++
++static inline int
++sys_mount_setattr(int dfd, const char *path, unsigned int flags,
++    struct mount_attr *attr, size_t size)
++{
++	return (syscall(__NR_mount_setattr, dfd, path, flags, attr, size));
++}
++
++static inline int
++sys_open_tree(int dfd, const char *filename, unsigned int flags)
++{
++	return (syscall(__NR_open_tree, dfd, filename, flags));
++}
++
++static inline int sys_move_mount(int from_dfd, const char *from_pathname,
++    int to_dfd, const char *to_pathname, unsigned int flags)
++{
++	return (syscall(__NR_move_mount, from_dfd, from_pathname, to_dfd,
++	    to_pathname, flags));
++}
++
++typedef enum idmap_type_t {
++	TYPE_UID,
++	TYPE_GID,
++	TYPE_BOTH
++} idmap_type_t;
++
++struct idmap_entry {
++	__u32 first;
++	__u32 lower_first;
++	__u32 count;
++	idmap_type_t type;
++	list_node_t node;
++};
++
++static void
++log_msg(const char *msg, ...)
++{
++	va_list ap;
++
++	va_start(ap, msg);
++	vfprintf(stderr, msg, ap);
++	fputc('\n', stderr);
++	va_end(ap);
++}
++
++#define	log_errno(msg, args...) \
++	do { \
++		log_msg("%s:%d:%s: [%m] " msg, __FILE__, __LINE__,\
++		    __FUNCTION__, ##args); \
++	} while (0)
++
++/*
++ * Parse the idmapping in the following format
++ * and add to the list:
++ *
++ *   u:nsid_first:hostid_first:count
++ *   g:nsid_first:hostid_first:count
++ *   b:nsid_first:hostid_first:count
++ *
++ * The delimiter can be : or space character.
++ *
++ * Return:
++ *   0      if success
++ *   ENOMEM if out of memory
++ *   EINVAL if wrong arg or input
++ */
++static int
++parse_idmap_entry(list_t *head, char *input)
++{
++	char *token, *savedptr = NULL;
++	struct idmap_entry *entry;
++	unsigned long ul;
++	char *delimiter = (char *)": ";
++	char c;
++
++	if (!input || !head)
++		return (EINVAL);
++	entry = malloc(sizeof (*entry));
++	if (!entry)
++		return (ENOMEM);
++
++	token = strtok_r(input, delimiter, &savedptr);
++	if (token)
++		c = token[0];
++	if (!token || (c != 'b' && c != 'u' && c != 'g'))
++		goto errout;
++	entry->type = (c == 'b') ? TYPE_BOTH :
++	    ((c == 'u') ? TYPE_UID : TYPE_GID);
++
++	token = strtok_r(NULL, delimiter, &savedptr);
++	if (!token)
++		goto errout;
++	ul = strtoul(token, NULL, 10);
++	if (ul > UINT_MAX || errno != 0)
++		goto errout;
++	entry->first = (__u32)ul;
++
++	token = strtok_r(NULL, delimiter, &savedptr);
++	if (!token)
++		goto errout;
++	ul = strtoul(token, NULL, 10);
++	if (ul > UINT_MAX || errno != 0)
++		goto errout;
++	entry->lower_first = (__u32)ul;
++
++	token = strtok_r(NULL, delimiter, &savedptr);
++	if (!token)
++		goto errout;
++	ul = strtoul(token, NULL, 10);
++	if (ul > UINT_MAX || errno != 0)
++		goto errout;
++	entry->count = (__u32)ul;
++
++	list_insert_tail(head, entry);
++
++	return (0);
++
++errout:
++	free(entry);
++	return (EINVAL);
++}
++
++/*
++ * Release all the entries in the list
++ */
++static void
++free_idmap(list_t *head)
++{
++	struct idmap_entry *entry;
++
++	while ((entry = list_remove_head(head)) != NULL)
++		free(entry);
++	/* list_destroy() to be done by the caller */
++}
++
++/*
++ * Write all bytes in the buffer to fd
++ */
++static ssize_t
++write_buf(int fd, const char *buf, size_t buf_size)
++{
++	ssize_t written, total_written = 0;
++	size_t remaining = buf_size;
++	char *position = (char *)buf;
++
++	for (;;) {
++		written = write(fd, position, remaining);
++		if (written < 0 && errno == EINTR)
++			continue;
++		if (written < 0) {
++			log_errno("write");
++			return (written);
++		}
++		total_written += written;
++		if (total_written == buf_size)
++			break;
++		remaining -= written;
++		position += written;
++	}
++
++	return (total_written);
++}
++
++/*
++ * Read data from file into buffer
++ */
++static ssize_t
++read_buf(int fd, char *buf, size_t buf_size)
++{
++	int ret;
++	for (;;) {
++		ret = read(fd, buf, buf_size);
++		if (ret < 0 && errno == EINTR)
++			continue;
++		break;
++	}
++	if (ret < 0)
++		log_errno("read");
++	return (ret);
++}
++
++/*
++ * Write idmap of the given type in the buffer to the
++ * process' uid_map or gid_map proc file.
++ *
++ * Return:
++ *   0     if success
++ *   errno if there's any error
++ */
++static int
++write_idmap(pid_t pid, char *buf, size_t buf_size, idmap_type_t type)
++{
++	char path[PATH_MAX];
++	int fd = -EBADF;
++	int ret;
++
++	(void) snprintf(path, sizeof (path), "/proc/%d/%cid_map",
++	    pid, type == TYPE_UID ? 'u' : 'g');
++	fd = open(path, O_WRONLY | O_CLOEXEC);
++	if (fd < 0) {
++		ret = errno;
++		log_errno("open(%s)", path);
++		goto out;
++	}
++	ret = write_buf(fd, buf, buf_size);
++	if (ret < 0)
++		ret = errno;
++	else
++		ret = 0;
++out:
++	if (fd > 0)
++		close(fd);
++	return (ret);
++}
++
++/*
++ * Write idmap info in the list to the process
++ * user namespace, i.e. its /proc/<pid>/uid_map
++ * and /proc/<pid>/gid_map file.
++ *
++ * Return:
++ *   0     if success
++ *   errno if it fails
++ */
++static int
++write_pid_idmaps(pid_t pid, list_t *head)
++{
++	char *buf_uids, *buf_gids;
++	char *curr_bufu, *curr_bufg;
++	/* max 4k to be allowed for each map */
++	int size_buf_uids = 4096, size_buf_gids = 4096;
++	struct idmap_entry *entry;
++	int uid_filled, gid_filled;
++	int ret;
++	int has_uids = 0, has_gids = 0;
++	size_t buf_size;
++
++	buf_uids = malloc(size_buf_uids);
++	if (!buf_uids)
++		return (ENOMEM);
++	buf_gids = malloc(size_buf_gids);
++	if (!buf_gids) {
++		free(buf_uids);
++		return (ENOMEM);
++	}
++	curr_bufu = buf_uids;
++	curr_bufg = buf_gids;
++
++	for (entry = list_head(head); entry; entry = list_next(head, entry)) {
++		if (entry->type == TYPE_UID || entry->type == TYPE_BOTH) {
++			uid_filled = snprintf(curr_bufu, size_buf_uids,
++			    "%u %u %u\n", entry->first, entry->lower_first,
++			    entry->count);
++			if (uid_filled <= 0 || uid_filled >= size_buf_uids) {
++				ret = E2BIG;
++				goto out;
++			}
++			curr_bufu += uid_filled;
++			size_buf_uids -= uid_filled;
++			has_uids = 1;
++		}
++		if (entry->type == TYPE_GID || entry->type == TYPE_BOTH) {
++			gid_filled = snprintf(curr_bufg, size_buf_gids,
++			    "%u %u %u\n", entry->first, entry->lower_first,
++			    entry->count);
++			if (gid_filled <= 0 || gid_filled >= size_buf_gids) {
++				ret = E2BIG;
++				goto out;
++			}
++			curr_bufg += gid_filled;
++			size_buf_gids -= gid_filled;
++			has_gids = 1;
++		}
++	}
++	if (has_uids) {
++		buf_size = curr_bufu - buf_uids;
++		ret = write_idmap(pid, buf_uids, buf_size, TYPE_UID);
++		if (ret)
++			goto out;
++	}
++	if (has_gids) {
++		buf_size = curr_bufg - buf_gids;
++		ret = write_idmap(pid, buf_gids, buf_size, TYPE_GID);
++	}
++
++out:
++	free(buf_uids);
++	free(buf_gids);
++	return (ret);
++}
++
++/*
++ * Wait for the child process to exit
++ * and reap it.
++ *
++ * Return:
++ *   process exit code if available
++ */
++static int
++wait_for_pid(pid_t pid)
++{
++	int status;
++	int ret;
++
++	for (;;) {
++		ret = waitpid(pid, &status, 0);
++		if (ret < 0) {
++			if (errno == EINTR)
++				continue;
++			return (EXIT_FAILURE);
++		}
++		break;
++	}
++	if (!WIFEXITED(status))
++		return (EXIT_FAILURE);
++	return (WEXITSTATUS(status));
++}
++
++/*
++ * Get the file descriptor of the process user namespace
++ * given its pid.
++ *
++ * Return:
++ *   fd  if success
++ *   -1  if it fails
++ */
++static int
++userns_fd_from_pid(pid_t pid)
++{
++	int fd;
++	char path[PATH_MAX];
++
++	(void) snprintf(path, sizeof (path), "/proc/%d/ns/user", pid);
++	fd = open(path, O_RDONLY | O_CLOEXEC);
++	if (fd < 0)
++		log_errno("open(%s)", path);
++	return (fd);
++}
++
++/*
++ * Get the user namespace file descriptor given a list
++ * of idmap info.
++ *
++ * Return:
++ *   fd     if success
++ *   -errno if it fails
++ */
++static int
++userns_fd_from_idmap(list_t *head)
++{
++	pid_t pid;
++	int ret, fd;
++	int pipe_fd[2];
++	char c;
++	int saved_errno = 0;
++
++	/* pipe for bidirectional communication */
++	ret = pipe(pipe_fd);
++	if (ret) {
++		log_errno("pipe");
++		return (-errno);
++	}
++
++	pid = fork();
++	if (pid < 0) {
++		log_errno("fork");
++		return (-errno);
++	}
++
++	if (pid == 0) {
++		/* child process */
++		close(pipe_fd[0]);
++		ret = unshare(CLONE_NEWUSER);
++		if (ret == 0) {
++			/* notify the parent of success */
++			ret = write_buf(pipe_fd[1], "1", 1);
++		} else {
++			saved_errno = errno;
++			log_errno("unshare");
++			ret = write_buf(pipe_fd[1], "0", 1);
++		}
++		if (ret < 0)
++			saved_errno = errno;
++		close(pipe_fd[1]);
++		exit(saved_errno);
++	}
++	/* parent process */
++	close(pipe_fd[1]);
++	ret = read_buf(pipe_fd[0], &c, 1);
++	if (ret == 1 && c == '1') {
++		ret = write_pid_idmaps(pid, head);
++		if (!ret) {
++			fd = userns_fd_from_pid(pid);
++			if (fd < 0)
++				fd = -errno;
++		} else {
++			fd = -ret;
++		}
++	} else {
++		fd = -EBADF;
++	}
++	close(pipe_fd[0]);
++	(void) wait_for_pid(pid);
++	return (fd);
++}
++
++/*
++ * Check if the operating system supports idmapped mount on the
++ * given path or not.
++ *
++ * Return:
++ *   true  if supported
++ *   false if not supported
++ */
++static bool
++is_idmap_supported(char *path)
++{
++	list_t head;
++	int ret;
++	int tree_fd = -EBADF, path_fd = -EBADF;
++	struct mount_attr attr = {
++	    .attr_set	= MOUNT_ATTR_IDMAP,
++	    .userns_fd  = -EBADF,
++	};
++
++	/* strtok_r() won't be happy with a const string */
++	char *input = strdup("b:0:1000000:1000000");
++
++	if (!input) {
++		errno = ENOMEM;
++		log_errno("strdup");
++		return (false);
++	}
++
++	list_create(&head, sizeof (struct idmap_entry),
++	    offsetof(struct idmap_entry, node));
++	ret = parse_idmap_entry(&head, input);
++	if (ret) {
++		errno = ret;
++		log_errno("parse_idmap_entry(%s)", input);
++		goto out;
++	}
++	ret = userns_fd_from_idmap(&head);
++	if (ret < 0)
++		goto out;
++	attr.userns_fd = ret;
++	ret = openat(-EBADF, path, O_DIRECTORY | O_CLOEXEC);
++	if (ret < 0) {
++		log_errno("openat(%s)", path);
++		goto out;
++	}
++	path_fd = ret;
++	ret = sys_open_tree(path_fd, "", AT_EMPTY_PATH | AT_NO_AUTOMOUNT |
++	    AT_SYMLINK_NOFOLLOW | OPEN_TREE_CLOEXEC | OPEN_TREE_CLONE);
++	if (ret < 0) {
++		log_errno("sys_open_tree");
++		goto out;
++	}
++	tree_fd = ret;
++	ret = sys_mount_setattr(tree_fd, "", AT_EMPTY_PATH, &attr,
++	    sizeof (attr));
++	if (ret < 0) {
++		log_errno("sys_mount_setattr");
++	}
++out:
++	free_idmap(&head);
++	list_destroy(&head);
++	if (tree_fd > 0)
++		close(tree_fd);
++	if (path_fd > 0)
++		close(path_fd);
++	if (attr.userns_fd > 0)
++		close(attr.userns_fd);
++	free(input);
++	return (ret == 0);
++}
++
++/*
++ * Check if the given path is a mount point or not.
++ *
++ * Return:
++ *   true  if it is
++ *   false otherwise
++ */
++static bool
++is_mountpoint(char *path)
++{
++	char *parent;
++	struct stat st_me, st_parent;
++	bool ret;
++
++	parent = malloc(strlen(path)+4);
++	if (!parent) {
++		errno = ENOMEM;
++		log_errno("malloc");
++		return (false);
++	}
++	strcat(strcpy(parent, path), "/..");
++	if (lstat(path, &st_me) != 0 ||
++	    lstat(parent, &st_parent) != 0)
++		ret = false;
++	else
++		if (st_me.st_dev != st_parent.st_dev ||
++		    st_me.st_ino == st_parent.st_ino)
++			ret = true;
++		else
++			ret = false;
++	free(parent);
++	return (ret);
++}
++
++/*
++ * Remount the source on the new target folder with the given
++ * list of idmap info. If target is NULL, the source will be
++ * unmounted and then remounted if it is a mountpoint, otherwise
++ * no unmount is done, the source is simply idmap remounted.
++ *
++ * Return:
++ *   0      if success
++ *   -errno otherwise
++ */
++static int
++do_idmap_mount(list_t *idmap, char *source, char *target, int flags)
++{
++	int ret;
++	int tree_fd = -EBADF, source_fd = -EBADF;
++	struct mount_attr attr = {
++	    .attr_set   = MOUNT_ATTR_IDMAP,
++	    .userns_fd  = -EBADF,
++	};
++
++	ret = userns_fd_from_idmap(idmap);
++	if (ret < 0)
++		goto out;
++	attr.userns_fd = ret;
++	ret = openat(-EBADF, source, O_DIRECTORY | O_CLOEXEC);
++	if (ret < 0) {
++		ret = -errno;
++		log_errno("openat(%s)", source);
++		goto out;
++	}
++	source_fd = ret;
++	ret = sys_open_tree(source_fd, "", AT_EMPTY_PATH | AT_NO_AUTOMOUNT |
++	    AT_SYMLINK_NOFOLLOW | OPEN_TREE_CLOEXEC | OPEN_TREE_CLONE | flags);
++	if (ret < 0) {
++		ret = -errno;
++		log_errno("sys_open_tree");
++		goto out;
++	}
++	tree_fd = ret;
++	ret = sys_mount_setattr(tree_fd, "", AT_EMPTY_PATH | flags, &attr,
++	    sizeof (attr));
++	if (ret < 0) {
++		ret = -errno;
++		log_errno("sys_mount_setattr");
++		goto out;
++	}
++	if (source != NULL && target == NULL && is_mountpoint(source)) {
++		ret = umount2(source, MNT_DETACH);
++		if (ret < 0) {
++			ret = -errno;
++			log_errno("umount2(%s)", source);
++			goto out;
++		}
++	}
++	ret = sys_move_mount(tree_fd, "", -EBADF, target == NULL ?
++	    source : target, MOVE_MOUNT_F_EMPTY_PATH);
++	if (ret < 0) {
++		ret = -errno;
++		log_errno("sys_move_mount(%s)", target == NULL ?
++		    source : target);
++	}
++out:
++	if (tree_fd > 0)
++		close(tree_fd);
++	if (source_fd > 0)
++		close(source_fd);
++	if (attr.userns_fd > 0)
++		close(attr.userns_fd);
++	return (ret);
++}
++
++static void
++print_usage(char *argv[])
++{
++	fprintf(stderr, "Usage: %s [-r] [-c] [-m <idmap1>] [-m <idmap2>]" \
++	    " ... [<source>] [<target>]\n", argv[0]);
++	fprintf(stderr, "\n");
++	fprintf(stderr, "  -r Recursively do idmapped mount.\n");
++	fprintf(stderr, "\n");
++	fprintf(stderr, "  -c Checks if idmapped mount is supported " \
++	    "on the <source> by the operating system or not.\n");
++	fprintf(stderr, "\n");
++	fprintf(stderr, "  -m <idmap> to specify the idmap info, " \
++	    "in the following format:\n");
++	fprintf(stderr, "     <id_type>:<nsid_first>:<hostid_first>:<count>\n");
++	fprintf(stderr, "\n");
++	fprintf(stderr, "  <id_type> can be either of 'b', 'u', and 'g'.\n");
++	fprintf(stderr, "\n");
++	fprintf(stderr, "The <source> folder will be mounted at <target> " \
++	    "with the provided idmap information.\nIf no <target> is " \
++	    "specified, and <source> is a mount point, " \
++	    "then <source> will be unmounted and then remounted.\n");
++}
++
++int
++main(int argc, char *argv[])
++{
++	int opt;
++	list_t idmap_head;
++	int check_supported = 0;
++	int ret = EXIT_SUCCESS;
++	char *source = NULL, *target = NULL;
++	int flags = 0;
++
++	list_create(&idmap_head, sizeof (struct idmap_entry),
++	    offsetof(struct idmap_entry, node));
++
++	while ((opt = getopt(argc, argv, "rcm:")) != -1) {
++		switch (opt) {
++		case 'r':
++			flags |= AT_RECURSIVE;
++			break;
++		case 'c':
++			check_supported = 1;
++			break;
++		case 'm':
++			ret = parse_idmap_entry(&idmap_head, optarg);
++			if (ret) {
++				errno = ret;
++				log_errno("parse_idmap_entry(%s)", optarg);
++				ret = EXIT_FAILURE;
++				goto out;
++			}
++			break;
++		default:
++			print_usage(argv);
++			exit(EXIT_FAILURE);
++		}
++	}
++
++	if (check_supported == 0 && list_is_empty(&idmap_head))	{
++		print_usage(argv);
++		ret = EXIT_FAILURE;
++		goto out;
++	}
++
++	if (optind >= argc) {
++		fprintf(stderr, "Expected to have <source>, <target>.\n");
++		print_usage(argv);
++		ret = EXIT_FAILURE;
++		goto out;
++	}
++
++	source = argv[optind];
++	if (optind < (argc - 1)) {
++		target = argv[optind + 1];
++	}
++
++	if (check_supported) {
++		free_idmap(&idmap_head);
++		list_destroy(&idmap_head);
++		if (is_idmap_supported(source)) {
++			printf("idmapped mount is supported on [%s].\n",
++			    source);
++			return (EXIT_SUCCESS);
++		} else {
++			printf("idmapped mount is NOT supported.\n");
++			return (EXIT_FAILURE);
++		}
++	}
++
++	ret = do_idmap_mount(&idmap_head, source, target, flags);
++	if (ret)
++		ret = EXIT_FAILURE;
++out:
++	free_idmap(&idmap_head);
++	list_destroy(&idmap_head);
++
++	exit(ret);
++}
+diff --git a/tests/zfs-tests/include/commands.cfg b/tests/zfs-tests/include/commands.cfg
+index 9953c94952e..db6ee24417c 100644
+--- a/tests/zfs-tests/include/commands.cfg
++++ b/tests/zfs-tests/include/commands.cfg
+@@ -220,4 +220,4 @@ export ZFSTEST_FILES='badsend
+     user_ns_exec
+     write_dos_attributes
+     xattrtest
+-    stride_dd'
++    idmap_util'
+diff --git a/tests/zfs-tests/tests/functional/idmap_mount/cleanup.ksh b/tests/zfs-tests/tests/functional/idmap_mount/cleanup.ksh
+new file mode 100755
+index 00000000000..4895aa23ee4
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/idmap_mount/cleanup.ksh
+@@ -0,0 +1,25 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or https://opensource.org/licenses/CDDL-1.0.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++. $STF_SUITE/include/libtest.shlib
++
++default_cleanup
+diff --git a/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount.cfg b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount.cfg
+new file mode 100644
+index 00000000000..51998945d0d
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount.cfg
+@@ -0,0 +1,25 @@
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or https://opensource.org/licenses/CDDL-1.0.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++export UID1=1000000
++export GID1=1000000
++export UID2=2000000
++export GID2=2000000
+diff --git a/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_001.ksh b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_001.ksh
+new file mode 100755
+index 00000000000..e7187935e53
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_001.ksh
+@@ -0,0 +1,76 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or https://opensource.org/licenses/CDDL-1.0.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++. $STF_SUITE/tests/functional/idmap_mount/idmap_mount_common.kshlib
++
++#
++#
++# DESCRIPTION:
++#       Test uid and gid of files in idmapped folder are mapped correctly
++#
++#
++# STRATEGY:
++#       1. Create files/folder owned by $UID1 and $GID1 under "idmap_test"
++#       2. Idmap the folder to "idmap_dest"
++#       3. Verify the owner of files/folder under "idmap_dest"
++#
++
++verify_runnable "global"
++
++export WORKDIR=$TESTDIR/idmap_test
++export IDMAPDIR=$TESTDIR/idmap_dest
++
++function cleanup
++{
++	log_must rm -rf $WORKDIR
++	if mountpoint $IDMAPDIR; then
++		log_must umount $IDMAPDIR
++	fi
++	log_must rm -rf $IDMAPDIR
++}
++
++log_onexit cleanup
++
++if ! idmap_util -c $TESTDIR; then
++	log_unsupported "Idmap mount not supported."
++fi
++
++log_must mkdir -p $WORKDIR
++log_must mkdir -p $IDMAPDIR
++log_must touch $WORKDIR/file1
++log_must mkdir $WORKDIR/subdir
++log_must ln -s $WORKDIR/file1 $WORKDIR/file1_sym
++log_must ln $WORKDIR/file1 $WORKDIR/subdir/file1_hard
++log_must touch $WORKDIR/subdir/file2
++log_must chown -R $UID1:$GID1 $WORKDIR
++log_must chown $UID2:$GID2 $WORKDIR/subdir/file2
++
++log_must idmap_util -m "u:${UID1}:${UID2}:1" -m "g:${GID1}:${GID2}:1" $WORKDIR $IDMAPDIR
++
++log_must test "$UID2 $GID2" = "$(stat -c '%u %g' $IDMAPDIR/file1)"
++log_must test "$UID2 $GID2" = "$(stat -c '%u %g' $IDMAPDIR/file1_sym)"
++log_must test "$UID2 $GID2" = "$(stat -c '%u %g' $IDMAPDIR/subdir)"
++log_must test "$UID2 $GID2" = "$(stat -c '%u %g' $IDMAPDIR/subdir/file1_hard)"
++log_mustnot test "$UID2 $GID2" = "$(stat -c '%u %g' $IDMAPDIR/subdir/file2)"
++
++log_pass "Owner verification of entries under idmapped folder is successful."
++
+diff --git a/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_002.ksh b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_002.ksh
+new file mode 100755
+index 00000000000..8cba90ea58b
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_002.ksh
+@@ -0,0 +1,97 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or https://opensource.org/licenses/CDDL-1.0.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++. $STF_SUITE/tests/functional/idmap_mount/idmap_mount_common.kshlib
++
++#
++#
++# DESCRIPTION:
++#       Perform file operations in idmapped folder, check owner in its base.
++#
++#
++# STRATEGY:
++#       1. Create folder "idmap_test"
++#       2. Idmap the folder to "idmap_dest"
++#       3. Do basic file operations in "idmap_dest" folder, verify the owner in
++#          the base folder "idmap_test"
++#
++
++verify_runnable "global"
++
++export WORKDIR=$TESTDIR/idmap_test
++export IDMAPDIR=$TESTDIR/idmap_dest
++
++function cleanup
++{
++	log_must rm -rf $IDMAPDIR/*
++	if mountpoint $IDMAPDIR; then
++		log_must umount $IDMAPDIR
++	fi
++	log_must rm -rf $IDMAPDIR $WORKDIR
++}
++
++log_onexit cleanup
++
++if ! idmap_util -c $TESTDIR; then
++	log_unsupported "Idmap mount not supported."
++fi
++
++log_must mkdir -p $WORKDIR
++log_must mkdir -p $IDMAPDIR
++
++log_must chown $UID1:$GID1 $WORKDIR
++log_must idmap_util -m "u:${UID1}:${UID2}:1" -m "g:${GID1}:${GID2}:1" $WORKDIR $IDMAPDIR
++
++SETPRIV="setpriv --reuid $UID2 --regid $GID2 --clear-groups"
++
++log_must $SETPRIV touch $IDMAPDIR/file1
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/file1)"
++
++log_must $SETPRIV mv $IDMAPDIR/file1 $IDMAPDIR/file1_renamed
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/file1_renamed)"
++
++log_must $SETPRIV mv $IDMAPDIR/file1_renamed $IDMAPDIR/file1
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/file1)"
++
++log_must $SETPRIV mkdir $IDMAPDIR/subdir
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/subdir)"
++
++log_must $SETPRIV ln -s $IDMAPDIR/file1 $IDMAPDIR/file1_sym
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/file1_sym)"
++
++log_must $SETPRIV ln $IDMAPDIR/file1 $IDMAPDIR/subdir/file1_hard
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/subdir/file1_hard)"
++
++log_must $SETPRIV touch $IDMAPDIR/subdir/file2
++log_must $SETPRIV chown $UID2:$GID2 $IDMAPDIR/subdir/file2
++log_mustnot $SETPRIV chown $UID1 $IDMAPDIR/subdir/file2
++
++log_must $SETPRIV cp -r $IDMAPDIR/subdir $IDMAPDIR/subdir1
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/subdir1/file2)"
++log_must $SETPRIV rm -rf $IDMAPDIR/subdir1
++
++log_must $SETPRIV cp -rp $IDMAPDIR/subdir $IDMAPDIR/subdir1
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/subdir1/file1_hard)"
++log_must $SETPRIV rm -rf $IDMAPDIR/subdir1
++
++log_pass "Owner verification of entries under base folder is successful."
++
+diff --git a/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_003.ksh b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_003.ksh
+new file mode 100755
+index 00000000000..1f1a2aec655
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_003.ksh
+@@ -0,0 +1,121 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or https://opensource.org/licenses/CDDL-1.0.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++. $STF_SUITE/tests/functional/idmap_mount/idmap_mount_common.kshlib
++
++#
++#
++# DESCRIPTION:
++#       Perform file operations in idmapped folder in user namespace,
++#       then check the owner in its base.
++#
++#
++# STRATEGY:
++#       1. Create folder "idmap_test"
++#       2. Idmap the folder to "idmap_dest"
++#       3. Perform file operations in the idmapped folder in the user
++#          namespace having the same idmap info as the idmapped mount
++#       4. Verify the owner of entries under the base folder "idmap_test"
++#
++
++verify_runnable "global"
++
++export WORKDIR=$TESTDIR/idmap_test
++export IDMAPDIR=$TESTDIR/idmap_dest
++
++function cleanup
++{
++	kill -TERM ${unshared_pid}
++	log_must rm -rf $IDMAPDIR/*
++	if mountpoint $IDMAPDIR; then
++		log_must umount $IDMAPDIR
++	fi
++	log_must rm -rf $IDMAPDIR $WORKDIR
++}
++
++log_onexit cleanup
++
++if ! idmap_util -c $TESTDIR; then
++	log_unsupported "Idmap mount not supported."
++fi
++
++log_must mkdir -p $WORKDIR
++log_must mkdir -p $IDMAPDIR
++
++log_must chown $UID1:$GID1 $WORKDIR
++log_must idmap_util -m "u:${UID1}:${UID2}:1" -m "g:${GID1}:${GID2}:1" $WORKDIR $IDMAPDIR
++
++# Create a user namespace with the same idmapping
++unshare -Urm echo test
++if [ "$?" -ne "0" ]; then
++	log_unsupported "Failed to create user namespace"
++fi
++unshare -Um /usr/bin/sleep 2h &
++unshared_pid=$!
++if [ "$?" -ne "0" ]; then
++	log_unsupported "Failed to create user namespace"
++fi
++# wait for userns to be ready
++sleep 1
++echo "${UID1} ${UID2} 1" > /proc/$unshared_pid/uid_map
++if [ "$?" -ne "0" ]; then
++	log_unsupported "Failed to write to uid_map"
++fi
++echo "${GID1} ${GID2} 1" > /proc/$unshared_pid/gid_map
++if [ "$?" -ne "0" ]; then
++	log_unsupported "Failed to write to gid_map"
++fi
++
++NSENTER="nsenter -t $unshared_pid --all -S ${UID1} -G ${GID1}"
++
++log_must $NSENTER touch $IDMAPDIR/file1
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/file1)"
++
++log_must $NSENTER mv $IDMAPDIR/file1 $IDMAPDIR/file1_renamed
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/file1_renamed)"
++
++log_must $NSENTER mv $IDMAPDIR/file1_renamed $IDMAPDIR/file1
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/file1)"
++
++log_must $NSENTER mkdir $IDMAPDIR/subdir
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/subdir)"
++
++log_must $NSENTER ln -s $IDMAPDIR/file1 $IDMAPDIR/file1_sym
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/file1_sym)"
++
++log_must $NSENTER ln $IDMAPDIR/file1 $IDMAPDIR/subdir/file1_hard
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/subdir/file1_hard)"
++
++log_must $NSENTER touch $IDMAPDIR/subdir/file2
++log_must $NSENTER chown $UID1:$GID1 $IDMAPDIR/subdir/file2
++log_mustnot $NSENTER chown $UID2 $IDMAPDIR/subdir/file2
++
++log_must $NSENTER cp -r $IDMAPDIR/subdir $IDMAPDIR/subdir1
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/subdir1/file2)"
++log_must $NSENTER rm -rf $IDMAPDIR/subdir1
++
++log_must $NSENTER cp -rp $IDMAPDIR/subdir $IDMAPDIR/subdir1
++log_must test "$UID1 $GID1" = "$(stat -c '%u %g' $WORKDIR/subdir1/file1_hard)"
++log_must $NSENTER rm -rf $IDMAPDIR/subdir1
++
++log_pass "Owner verification of entries under the base folder is successful."
++
+diff --git a/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_004.ksh b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_004.ksh
+new file mode 100755
+index 00000000000..89f2f750d23
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_004.ksh
+@@ -0,0 +1,106 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or https://opensource.org/licenses/CDDL-1.0.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++. $STF_SUITE/tests/functional/idmap_mount/idmap_mount_common.kshlib
++
++#
++#
++# DESCRIPTION:
++#       Test setgid bit is set properly on the idmapped mount
++#       in a user namespace.
++#
++# STRATEGY:
++#       1. Create folder "idmap_test", set gid bit on it
++#       2. Idmap the folder to "idmap_dest"
++#       3. Create file and folder in the idmapped folder in the user
++#          namespace having the same idmap info 
++#       4. Verify the gid bit of the file and folder is set
++#
++
++verify_runnable "global"
++
++export WORKDIR=$TESTDIR/idmap_test
++export IDMAPDIR=$TESTDIR/idmap_dest
++
++function cleanup
++{
++	kill -TERM ${unshared_pid}
++	log_must rm -rf $IDMAPDIR/*
++	if mountpoint $IDMAPDIR; then
++		log_must umount $IDMAPDIR
++	fi
++	log_must rm -rf $IDMAPDIR $WORKDIR
++}
++
++log_onexit cleanup
++
++if ! idmap_util -c $TESTDIR; then
++	log_unsupported "Idmap mount not supported."
++fi
++
++log_must mkdir -p $WORKDIR
++log_must mkdir -p $IDMAPDIR
++
++log_must chown $UID1:$GID1 $WORKDIR
++# set gid bit
++log_must chmod 2755 $WORKDIR
++log_must idmap_util -m "u:${UID1}:${UID2}:1" -m "g:${GID1}:${GID2}:1" $WORKDIR $IDMAPDIR
++log_must test -g $IDMAPDIR
++
++# Create a user namespace with the same idmapping
++unshare -Urm echo test
++if [ "$?" -ne "0" ]; then
++	log_unsupported "Failed to create user namespace"
++fi
++unshare -Um /usr/bin/sleep 2h &
++unshared_pid=$!
++if [ "$?" -ne "0" ]; then
++	log_unsupported "Failed to create user namespace"
++fi
++# wait for userns to be ready
++sleep 1
++echo "${UID1} ${UID2} 1" > /proc/$unshared_pid/uid_map
++if [ "$?" -ne "0" ]; then
++	log_unsupported "Failed to write to uid_map"
++fi
++echo "${GID1} ${GID2} 1" > /proc/$unshared_pid/gid_map
++if [ "$?" -ne "0" ]; then
++	log_unsupported "Failed to write to gid_map"
++fi
++
++NSENTER="nsenter -t $unshared_pid --all -S ${UID1} -G ${GID1}"
++
++# gid bit can be set on the file
++log_must $NSENTER touch $IDMAPDIR/file1
++log_must $NSENTER chmod 2654 $IDMAPDIR/file1
++log_must test -g $WORKDIR/file1
++log_must test -g $IDMAPDIR/file1
++log_must test "$UID1 $GID1" = "$($NSENTER stat -c '%u %g' $IDMAPDIR/file1)"
++
++# gid bit is carried over to new folder
++log_must $NSENTER mkdir $IDMAPDIR/subdir
++log_must test -g $WORKDIR/subdir
++log_must test -g $IDMAPDIR/subdir
++log_must test "$UID1 $GID1" = "$($NSENTER stat -c '%u %g' $IDMAPDIR/subdir)"
++
++log_pass "Verification of setting gid bit in userns is successful."
++
+diff --git a/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_common.kshlib b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_common.kshlib
+new file mode 100644
+index 00000000000..980845ca209
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/idmap_mount/idmap_mount_common.kshlib
+@@ -0,0 +1,23 @@
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or https://opensource.org/licenses/CDDL-1.0.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++. $STF_SUITE/include/libtest.shlib
++. $STF_SUITE/tests/functional/idmap_mount/idmap_mount.cfg
+diff --git a/tests/zfs-tests/tests/functional/idmap_mount/setup.ksh b/tests/zfs-tests/tests/functional/idmap_mount/setup.ksh
+new file mode 100755
+index 00000000000..90a14f12058
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/idmap_mount/setup.ksh
+@@ -0,0 +1,30 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or https://opensource.org/licenses/CDDL-1.0.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++. $STF_SUITE/include/libtest.shlib
++
++# unable to do idmapped mount in a local zone
++verify_runnable "global"
++
++DISK=${DISKS%% *}
++default_setup $DISK
++
+
+From d6b868c52df987a992908763b253172112f895ec Mon Sep 17 00:00:00 2001
+From: Spotlight <spotlight@joscomputing.space>
+Date: Wed, 26 Apr 2023 12:13:04 -0500
+Subject: [PATCH 3/3] Backport "idmap_mount tests can be skipped on older
+ kernel"
+
+---
+ tests/test-runner/bin/zts-report.py.in | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/tests/test-runner/bin/zts-report.py.in b/tests/test-runner/bin/zts-report.py.in
+index 432899c21f4..a98e8175b06 100755
+--- a/tests/test-runner/bin/zts-report.py.in
++++ b/tests/test-runner/bin/zts-report.py.in
+@@ -146,6 +146,11 @@ na_reason = "Not applicable"
+ #
+ ci_reason = 'CI runner doesn\'t have all requirements'
+ 
++#
++# Idmapped mount is only supported in kernel version >= 5.12
++#
++idmap_reason = 'Idmapped mount needs kernel 5.12+'
++
+ summary = {
+     'total': float(0),
+     'passed': float(0),
+@@ -289,6 +294,10 @@ elif sys.platform.startswith('linux'):
+         'mmp/mmp_inactive_import': ['FAIL', known_reason],
+         'zvol/zvol_misc/zvol_misc_snapdev': ['FAIL', '12621'],
+         'zvol/zvol_misc/zvol_misc_volmode': ['FAIL', known_reason],
++        'idmap_mount/idmap_mount_001': ['SKIP', idmap_reason],
++        'idmap_mount/idmap_mount_002': ['SKIP', idmap_reason],
++        'idmap_mount/idmap_mount_003': ['SKIP', idmap_reason],
++        'idmap_mount/idmap_mount_004': ['SKIP', idmap_reason],
+     })
+ 
+ 

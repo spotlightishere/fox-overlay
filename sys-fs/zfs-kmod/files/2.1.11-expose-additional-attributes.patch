@@ -1,0 +1,1272 @@
+From 2f38cb2c0640a7d53062b57aab3bf8620fc49237 Mon Sep 17 00:00:00 2001
+From: Umer Saleem <usaleem@ixsystems.com>
+Date: Fri, 18 Feb 2022 21:21:20 +0500
+Subject: [PATCH] Expose additional file level attributes
+
+ZFS allows to update and retrieve additional file level attributes for
+FreeBSD. This commit allows additional file level attributes to be
+updated and retrieved for Linux. These include the flags stored in the
+upper half of z_pflags only.
+
+Two new IOCTLs have been added for this purpose. ZFS_IOC_GETDOSFLAGS
+can be used to retieve the attributes, while ZFS_IOC_SETDOSFLAGS can
+be used to update the attributes.
+
+Attributes that are allowed to be updated include ZFS_IMMUTABLE,
+ZFS_APPENDONLY, ZFS_NOUNLINK, ZFS_ARCHIVE, ZFS_NODUMP, ZFS_SYSTEM,
+ZFS_HIDDEN, ZFS_READONLY, ZFS_REPARSE, ZFS_OFFLINE and ZFS_SPARSE.
+Flags can be or'd together while calling ZFS_IOC_SETDOSFLAGS.
+
+Signed-off-by: Umer Saleem <usaleem@ixsystems.com>
+---
+ configure.ac                                  |   3 +
+ include/sys/fs/zfs.h                          |  35 +++
+ include/sys/zfs_znode.h                       |   2 +-
+ module/os/linux/zfs/zpl_file.c                | 125 +++++++++--
+ tests/runfiles/common.run                     |   2 +-
+ tests/runfiles/freebsd.run                    |   4 -
+ tests/runfiles/linux.run                      |   4 +
+ tests/zfs-tests/cmd/Makefile.am               |   2 +
+ .../cmd/read_dos_attributes/.gitignore        |   1 +
+ .../cmd/read_dos_attributes/Makefile.am       |   6 +
+ .../read_dos_attributes/read_dos_attributes.c | 167 +++++++++++++++
+ .../cmd/write_dos_attributes/.gitignore       |   1 +
+ .../cmd/write_dos_attributes/Makefile.am      |   6 +
+ .../write_dos_attributes.c                    | 201 ++++++++++++++++++
+ tests/zfs-tests/include/commands.cfg          |   2 +
+ tests/zfs-tests/tests/functional/Makefile.am  |   1 +
+ .../tests/functional/acl/off/Makefile.am      |   2 -
+ .../tests/functional/acl/off/dosmode.ksh      |  97 +++++----
+ .../acl/off/dosmode_readonly_write.c          |  11 +
+ .../functional/dos_attributes/Makefile.am     |   8 +
+ .../functional/dos_attributes/cleanup.ksh     |  34 +++
+ .../dos_attributes/read_dos_attrs_001.ksh     |  60 ++++++
+ .../tests/functional/dos_attributes/setup.ksh |  35 +++
+ .../dos_attributes/write_dos_attrs_001.ksh    |  61 ++++++
+ 24 files changed, 806 insertions(+), 64 deletions(-)
+ create mode 100644 tests/zfs-tests/cmd/read_dos_attributes/.gitignore
+ create mode 100644 tests/zfs-tests/cmd/read_dos_attributes/Makefile.am
+ create mode 100644 tests/zfs-tests/cmd/read_dos_attributes/read_dos_attributes.c
+ create mode 100644 tests/zfs-tests/cmd/write_dos_attributes/.gitignore
+ create mode 100644 tests/zfs-tests/cmd/write_dos_attributes/Makefile.am
+ create mode 100644 tests/zfs-tests/cmd/write_dos_attributes/write_dos_attributes.c
+ create mode 100644 tests/zfs-tests/tests/functional/dos_attributes/Makefile.am
+ create mode 100755 tests/zfs-tests/tests/functional/dos_attributes/cleanup.ksh
+ create mode 100755 tests/zfs-tests/tests/functional/dos_attributes/read_dos_attrs_001.ksh
+ create mode 100755 tests/zfs-tests/tests/functional/dos_attributes/setup.ksh
+ create mode 100755 tests/zfs-tests/tests/functional/dos_attributes/write_dos_attrs_001.ksh
+
+diff --git a/configure.ac b/configure.ac
+index 7037c06b225..990958bafa1 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -226,12 +226,14 @@ AC_CONFIG_FILES([
+ 	tests/zfs-tests/cmd/randfree_file/Makefile
+ 	tests/zfs-tests/cmd/randwritecomp/Makefile
+ 	tests/zfs-tests/cmd/readmmap/Makefile
++	tests/zfs-tests/cmd/read_dos_attributes/Makefile
+ 	tests/zfs-tests/cmd/rename_dir/Makefile
+ 	tests/zfs-tests/cmd/rm_lnkcnt_zero_file/Makefile
+ 	tests/zfs-tests/cmd/send_doall/Makefile
+ 	tests/zfs-tests/cmd/stride_dd/Makefile
+ 	tests/zfs-tests/cmd/threadsappend/Makefile
+ 	tests/zfs-tests/cmd/user_ns_exec/Makefile
++	tests/zfs-tests/cmd/write_dos_attributes/Makefile
+ 	tests/zfs-tests/cmd/xattrtest/Makefile
+ 	tests/zfs-tests/include/Makefile
+ 	tests/zfs-tests/tests/Makefile
+@@ -333,6 +335,7 @@ AC_CONFIG_FILES([
+ 	tests/zfs-tests/tests/functional/deadman/Makefile
+ 	tests/zfs-tests/tests/functional/delegate/Makefile
+ 	tests/zfs-tests/tests/functional/devices/Makefile
++	tests/zfs-tests/tests/functional/dos_attributes/Makefile
+ 	tests/zfs-tests/tests/functional/events/Makefile
+ 	tests/zfs-tests/tests/functional/exec/Makefile
+ 	tests/zfs-tests/tests/functional/fallocate/Makefile
+diff --git a/include/sys/fs/zfs.h b/include/sys/fs/zfs.h
+index 6e85c4b7b39..ab29b4e2ef3 100644
+--- a/include/sys/fs/zfs.h
++++ b/include/sys/fs/zfs.h
+@@ -1459,6 +1459,41 @@ typedef enum zfs_ioc {
+  */
+ #define	BLKZNAME		_IOR(0x12, 125, char[ZFS_MAX_DATASET_NAME_LEN])
+ 
++#ifdef __linux__
++
++/*
++ * IOCTLs to update and retrieve additional file level attributes on
++ * Linux.
++ */
++#define	ZFS_IOC_GETDOSFLAGS	_IOR(0x83, 1, uint64_t)
++#define	ZFS_IOC_SETDOSFLAGS	_IOW(0x83, 2, uint64_t)
++
++/*
++ * Additional file level attributes, that are stored
++ * in the upper half of z_pflags
++ */
++#define	ZFS_READONLY		0x0000000100000000ull
++#define	ZFS_HIDDEN		0x0000000200000000ull
++#define	ZFS_SYSTEM		0x0000000400000000ull
++#define	ZFS_ARCHIVE		0x0000000800000000ull
++#define	ZFS_IMMUTABLE		0x0000001000000000ull
++#define	ZFS_NOUNLINK		0x0000002000000000ull
++#define	ZFS_APPENDONLY		0x0000004000000000ull
++#define	ZFS_NODUMP		0x0000008000000000ull
++#define	ZFS_OPAQUE		0x0000010000000000ull
++#define	ZFS_AV_QUARANTINED	0x0000020000000000ull
++#define	ZFS_AV_MODIFIED		0x0000040000000000ull
++#define	ZFS_REPARSE		0x0000080000000000ull
++#define	ZFS_OFFLINE		0x0000100000000000ull
++#define	ZFS_SPARSE		0x0000200000000000ull
++
++#define	ZFS_DOS_FL_USER_VISIBLE	(ZFS_IMMUTABLE | ZFS_APPENDONLY | \
++	    ZFS_NOUNLINK | ZFS_ARCHIVE | ZFS_NODUMP | ZFS_SYSTEM | \
++	    ZFS_HIDDEN | ZFS_READONLY | ZFS_REPARSE | ZFS_OFFLINE | \
++	    ZFS_SPARSE)
++
++#endif
++
+ /*
+  * ZFS-specific error codes used for returning descriptive errors
+  * to the userland through zfs ioctls.
+diff --git a/include/sys/zfs_znode.h b/include/sys/zfs_znode.h
+index e20c18cc2b6..127fd8736ff 100644
+--- a/include/sys/zfs_znode.h
++++ b/include/sys/zfs_znode.h
+@@ -37,7 +37,7 @@ extern "C" {
+ 
+ /*
+  * Additional file level attributes, that are stored
+- * in the upper half of zp_flags
++ * in the upper half of z_pflags
+  */
+ #define	ZFS_READONLY		0x0000000100000000ull
+ #define	ZFS_HIDDEN		0x0000000200000000ull
+diff --git a/module/os/linux/zfs/zpl_file.c b/module/os/linux/zfs/zpl_file.c
+index 982b424197e..f78e50262af 100644
+--- a/module/os/linux/zfs/zpl_file.c
++++ b/module/os/linux/zfs/zpl_file.c
+@@ -905,21 +905,24 @@ __zpl_ioctl_setflags(struct inode *ip, uint32_t ioctl_flags, xvattr_t *xva)
+ 	xva_init(xva);
+ 	xoap = xva_getxoptattr(xva);
+ 
+-	XVA_SET_REQ(xva, XAT_IMMUTABLE);
+-	if (ioctl_flags & FS_IMMUTABLE_FL)
+-		xoap->xoa_immutable = B_TRUE;
+-
+-	XVA_SET_REQ(xva, XAT_APPENDONLY);
+-	if (ioctl_flags & FS_APPEND_FL)
+-		xoap->xoa_appendonly = B_TRUE;
+-
+-	XVA_SET_REQ(xva, XAT_NODUMP);
+-	if (ioctl_flags & FS_NODUMP_FL)
+-		xoap->xoa_nodump = B_TRUE;
+-
+-	XVA_SET_REQ(xva, XAT_PROJINHERIT);
+-	if (ioctl_flags & ZFS_PROJINHERIT_FL)
+-		xoap->xoa_projinherit = B_TRUE;
++#define	FLAG_CHANGE(iflag, zflag, xflag, xfield)	do {	\
++	if (((ioctl_flags & (iflag)) && !(zfs_flags & (zflag))) ||	\
++	    ((zfs_flags & (zflag)) && !(ioctl_flags & (iflag)))) {	\
++		XVA_SET_REQ(xva, (xflag));	\
++		(xfield) = ((ioctl_flags & (iflag)) != 0);	\
++	}	\
++} while (0)
++
++	FLAG_CHANGE(FS_IMMUTABLE_FL, ZFS_IMMUTABLE, XAT_IMMUTABLE,
++	    xoap->xoa_immutable);
++	FLAG_CHANGE(FS_APPEND_FL, ZFS_APPENDONLY, XAT_APPENDONLY,
++	    xoap->xoa_appendonly);
++	FLAG_CHANGE(FS_NODUMP_FL, ZFS_NODUMP, XAT_NODUMP,
++	    xoap->xoa_nodump);
++	FLAG_CHANGE(ZFS_PROJINHERIT_FL, ZFS_PROJINHERIT, XAT_PROJINHERIT,
++	    xoap->xoa_projinherit);
++
++#undef	FLAG_CHANGE
+ 
+ 	return (0);
+ }
+@@ -998,6 +1001,94 @@ zpl_ioctl_setxattr(struct file *filp, void __user *arg)
+ 	return (err);
+ }
+ 
++/*
++ * Expose Additional File Level Attributes of ZFS.
++ */
++static int
++zpl_ioctl_getdosflags(struct file *filp, void __user *arg)
++{
++	struct inode *ip = file_inode(filp);
++	uint64_t dosflags = ITOZ(ip)->z_pflags;
++	dosflags &= ZFS_DOS_FL_USER_VISIBLE;
++	int err = copy_to_user(arg, &dosflags, sizeof (dosflags));
++
++	return (err);
++}
++
++static int
++__zpl_ioctl_setdosflags(struct inode *ip, uint64_t ioctl_flags, xvattr_t *xva)
++{
++	uint64_t zfs_flags = ITOZ(ip)->z_pflags;
++	xoptattr_t *xoap;
++
++	if (ioctl_flags & (~ZFS_DOS_FL_USER_VISIBLE))
++		return (-EOPNOTSUPP);
++
++	if ((fchange(ioctl_flags, zfs_flags, ZFS_IMMUTABLE, ZFS_IMMUTABLE) ||
++	    fchange(ioctl_flags, zfs_flags, ZFS_APPENDONLY, ZFS_APPENDONLY)) &&
++	    !capable(CAP_LINUX_IMMUTABLE))
++		return (-EPERM);
++
++	if (!zpl_inode_owner_or_capable(kcred->user_ns, ip))
++		return (-EACCES);
++
++	xva_init(xva);
++	xoap = xva_getxoptattr(xva);
++
++#define	FLAG_CHANGE(iflag, xflag, xfield)	do {	\
++	if (((ioctl_flags & (iflag)) && !(zfs_flags & (iflag))) ||	\
++	    ((zfs_flags & (iflag)) && !(ioctl_flags & (iflag)))) {	\
++		XVA_SET_REQ(xva, (xflag));	\
++		(xfield) = ((ioctl_flags & (iflag)) != 0);	\
++	}	\
++} while (0)
++
++	FLAG_CHANGE(ZFS_IMMUTABLE, XAT_IMMUTABLE, xoap->xoa_immutable);
++	FLAG_CHANGE(ZFS_APPENDONLY, XAT_APPENDONLY, xoap->xoa_appendonly);
++	FLAG_CHANGE(ZFS_NODUMP, XAT_NODUMP, xoap->xoa_nodump);
++	FLAG_CHANGE(ZFS_READONLY, XAT_READONLY, xoap->xoa_readonly);
++	FLAG_CHANGE(ZFS_HIDDEN, XAT_HIDDEN, xoap->xoa_hidden);
++	FLAG_CHANGE(ZFS_SYSTEM, XAT_SYSTEM, xoap->xoa_system);
++	FLAG_CHANGE(ZFS_ARCHIVE, XAT_ARCHIVE, xoap->xoa_archive);
++	FLAG_CHANGE(ZFS_NOUNLINK, XAT_NOUNLINK, xoap->xoa_nounlink);
++	FLAG_CHANGE(ZFS_REPARSE, XAT_REPARSE, xoap->xoa_reparse);
++	FLAG_CHANGE(ZFS_OFFLINE, XAT_OFFLINE, xoap->xoa_offline);
++	FLAG_CHANGE(ZFS_SPARSE, XAT_SPARSE, xoap->xoa_sparse);
++
++#undef	FLAG_CHANGE
++
++	return (0);
++}
++
++/*
++ * Set Additional File Level Attributes of ZFS.
++ */
++static int
++zpl_ioctl_setdosflags(struct file *filp, void __user *arg)
++{
++	struct inode *ip = file_inode(filp);
++	uint64_t dosflags;
++	cred_t *cr = CRED();
++	xvattr_t xva;
++	int err;
++	fstrans_cookie_t cookie;
++
++	if (copy_from_user(&dosflags, arg, sizeof (dosflags)))
++		return (-EFAULT);
++
++	err = __zpl_ioctl_setdosflags(ip, dosflags, &xva);
++	if (err)
++		return (err);
++
++	crhold(cr);
++	cookie = spl_fstrans_mark();
++	err = -zfs_setattr(ITOZ(ip), (vattr_t *)&xva, 0, cr);
++	spl_fstrans_unmark(cookie);
++	crfree(cr);
++
++	return (err);
++}
++
+ static long
+ zpl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ {
+@@ -1012,6 +1103,10 @@ zpl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		return (zpl_ioctl_getxattr(filp, (void *)arg));
+ 	case ZFS_IOC_FSSETXATTR:
+ 		return (zpl_ioctl_setxattr(filp, (void *)arg));
++	case ZFS_IOC_GETDOSFLAGS:
++		return (zpl_ioctl_getdosflags(filp, (void *)arg));
++	case ZFS_IOC_SETDOSFLAGS:
++		return (zpl_ioctl_setdosflags(filp, (void *)arg));
+ 	default:
+ 		return (-ENOTTY);
+ 	}
+diff --git a/tests/runfiles/common.run b/tests/runfiles/common.run
+index 9f11284ad62..eb0d451351f 100644
+--- a/tests/runfiles/common.run
++++ b/tests/runfiles/common.run
+@@ -29,7 +29,7 @@ outputdir = /var/tmp/test_results
+ tags = ['functional']
+ 
+ [tests/functional/acl/off]
+-tests = ['posixmode']
++tests = ['dosmode', 'posixmode']
+ tags = ['functional', 'acl']
+ 
+ [tests/functional/alloc_class]
+diff --git a/tests/runfiles/freebsd.run b/tests/runfiles/freebsd.run
+index 153b204b493..c7ca1d769fc 100644
+--- a/tests/runfiles/freebsd.run
++++ b/tests/runfiles/freebsd.run
+@@ -22,10 +22,6 @@ failsafe = callbacks/zfs_failsafe
+ outputdir = /var/tmp/test_results
+ tags = ['functional']
+ 
+-[tests/functional/acl/off:FreeBSD]
+-tests = ['dosmode']
+-tags = ['functional', 'acl']
+-
+ [tests/functional/cli_root/zfs_jail:FreeBSD]
+ tests = ['zfs_jail_001_pos']
+ tags = ['functional', 'cli_root', 'zfs_jail']
+diff --git a/tests/runfiles/linux.run b/tests/runfiles/linux.run
+index 7186d5d67ac..8412a7ea5a9 100644
+--- a/tests/runfiles/linux.run
++++ b/tests/runfiles/linux.run
+@@ -149,6 +149,10 @@ tests = ['projectid_001_pos', 'projectid_002_pos', 'projectid_003_pos',
+     'projecttree_001_pos', 'projecttree_002_pos', 'projecttree_003_neg']
+ tags = ['functional', 'projectquota']
+ 
++[tests/functional/dos_attributes:Linux]
++tests = ['read_dos_attrs_001', 'write_dos_attrs_001']
++tags = ['functional', 'dos_attributes']
++
+ [tests/functional/rsend:Linux]
+ tests = ['send_realloc_dnode_size', 'send_encrypted_files']
+ tags = ['functional', 'rsend']
+diff --git a/tests/zfs-tests/cmd/Makefile.am b/tests/zfs-tests/cmd/Makefile.am
+index 2470397a90a..88d8c8cf08b 100644
+--- a/tests/zfs-tests/cmd/Makefile.am
++++ b/tests/zfs-tests/cmd/Makefile.am
+@@ -34,6 +34,8 @@ if BUILD_LINUX
+ SUBDIRS += \
+ 	getversion \
+ 	randfree_file \
++	read_dos_attributes \
+ 	user_ns_exec \
++	write_dos_attributes \
+ 	xattrtest
+ endif
+diff --git a/tests/zfs-tests/cmd/read_dos_attributes/.gitignore b/tests/zfs-tests/cmd/read_dos_attributes/.gitignore
+new file mode 100644
+index 00000000000..52584e4a738
+--- /dev/null
++++ b/tests/zfs-tests/cmd/read_dos_attributes/.gitignore
+@@ -0,0 +1 @@
++/read_dos_attributes
+diff --git a/tests/zfs-tests/cmd/read_dos_attributes/Makefile.am b/tests/zfs-tests/cmd/read_dos_attributes/Makefile.am
+new file mode 100644
+index 00000000000..69412f05f65
+--- /dev/null
++++ b/tests/zfs-tests/cmd/read_dos_attributes/Makefile.am
+@@ -0,0 +1,6 @@
++include $(top_srcdir)/config/Rules.am
++
++pkgexecdir = $(datadir)/@PACKAGE@/zfs-tests/bin
++
++pkgexec_PROGRAMS = read_dos_attributes
++read_dos_attributes_SOURCES = read_dos_attributes.c
+diff --git a/tests/zfs-tests/cmd/read_dos_attributes/read_dos_attributes.c b/tests/zfs-tests/cmd/read_dos_attributes/read_dos_attributes.c
+new file mode 100644
+index 00000000000..ed0906c36a6
+--- /dev/null
++++ b/tests/zfs-tests/cmd/read_dos_attributes/read_dos_attributes.c
+@@ -0,0 +1,167 @@
++/*
++ * This file and its contents are supplied under the terms of the
++ * Common Development and Distribution License ("CDDL"), version 1.0.
++ * You may only use this file in accordance with the terms of version
++ * 1.0 of the CDDL.
++ *
++ * A full copy of the text of the CDDL should have accompanied this
++ * source.  A copy of the CDDL is also available via the Internet at
++ * http://www.illumos.org/license/CDDL.
++ */
++
++/*
++ * Copyright 2022 iXsystems, Inc.
++ */
++
++/*
++ * FreeBSD allows to update and retreive additional file level attributes.
++ * For Linux, two IOCTLs have been added to update and retrieve additional
++ * level attributes.
++ *
++ * This application reads additional file level attributes on a given
++ * file and prints FreeBSD keywords that map to respective attributes.
++ *
++ * Usage: 'read_dos_attributes filepath'
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <err.h>
++#include <sys/fs/zfs.h>
++#include <string.h>
++
++#define	SU_ARCH_SHORT				"arch"
++#define	SU_ARCH_FULL				"archived"
++#define	SU_NODUMP				"nodump"
++#define	SU_APPEND_SHORT				"sappnd"
++#define	SU_APPEND_FULL				"sappend"
++#define	SU_IMMUTABLE				"schg"
++#define	SU_IMMUTABLE_SHORT			"schange"
++#define	SU_IMMUTABLE_FULL			"simmutable"
++#define	SU_UNLINK_SHORT				"sunlnk"
++#define	SU_UNLINK_FULL				"sunlink"
++#define	U_APPEND_SHORT				"uappnd"
++#define	U_APPEND_FULL				"uappend"
++#define	U_ARCH_SHORT				"uarch"
++#define	U_ARCH_FULL				"uarchive"
++#define	U_IMMUTABLE				"uchg"
++#define	U_IMMUTABLE_SHORT			"uchange"
++#define	U_IMMUTABLE_FULL			"uimmutable"
++#define	U_HIDDEN_SHORT				"hidden"
++#define	U_HIDDEN_FULL				"uhidden"
++#define	U_OFFLINE_SHORT				"offline"
++#define	U_OFFLINE_FULL				"uoffline"
++#define	U_RDONLY				"rdonly"
++#define	U_RDONLY_SHORT				"urdonly"
++#define	U_RDONLY_FULL				"readonly"
++#define	U_SPARSE_SHORT				"sparse"
++#define	U_SPARSE_FULL				"usparse"
++#define	U_SYSTEM_SHORT				"system"
++#define	U_SYSTEM_FULL				"usystem"
++#define	U_REPARSE_SHORT				"reparse"
++#define	U_REPARSE_FULL				"ureparse"
++#define	U_UNLINK_SHORT				"uunlnk"
++#define	U_UNLINK_FULL				"uunlink"
++#define	UNSET_NODUMP				"dump"
++
++#define	NO_ATTRIBUTE				"-"
++
++#define	SEPARATOR				","
++
++#define	BUFFER_SIZE				0x200
++
++void attribute_to_str(uint64_t attributes, char *buff);
++
++void
++attribute_to_str(uint64_t attributes, char *buff)
++{
++	if (attributes & ZFS_ARCHIVE) {
++		strcat(buff, U_ARCH_SHORT);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (attributes & ZFS_APPENDONLY) {
++		strcat(buff, U_APPEND_SHORT);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (attributes & ZFS_IMMUTABLE) {
++		strcat(buff, U_IMMUTABLE_FULL);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (attributes & ZFS_NOUNLINK) {
++		strcat(buff, U_UNLINK_SHORT);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (attributes & ZFS_NODUMP) {
++		strcat(buff, SU_NODUMP);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (attributes & ZFS_HIDDEN) {
++		strcat(buff, U_HIDDEN_SHORT);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (attributes & ZFS_OFFLINE) {
++		strcat(buff, U_OFFLINE_SHORT);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (attributes & ZFS_READONLY) {
++		strcat(buff, U_RDONLY);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (attributes & ZFS_SPARSE) {
++		strcat(buff, U_SPARSE_SHORT);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (attributes & ZFS_SYSTEM) {
++		strcat(buff, U_SYSTEM_SHORT);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (attributes & ZFS_REPARSE) {
++		strcat(buff, U_REPARSE_SHORT);
++		strcat(buff, SEPARATOR);
++	}
++
++	if (buff[0] == '\0')
++		strcat(buff, NO_ATTRIBUTE);
++	else
++		buff[strlen(buff) - 1] = '\0';
++}
++
++int
++main(int argc, const char * const argv[])
++{
++	if (argc != 2)
++		errx(EXIT_FAILURE, "Usage: %s filepath", argv[0]);
++
++	int fd = open(argv[1], O_RDWR | O_APPEND);
++	if (fd < 0)
++		err(EXIT_FAILURE, "Failed to open %s", argv[1]);
++
++	uint64_t dosflags = 0;
++	if (ioctl(fd, ZFS_IOC_GETDOSFLAGS, &dosflags) == -1)
++		err(EXIT_FAILURE, "ZFS_IOC_GETDOSFLAGS failed");
++
++	(void) close(fd);
++
++	char buffer[BUFFER_SIZE];
++	memset(buffer, 0, BUFFER_SIZE);
++
++	(void) attribute_to_str(dosflags, buffer);
++
++	(void) printf("%s\n", buffer);
++
++	return (EXIT_SUCCESS);
++}
+diff --git a/tests/zfs-tests/cmd/write_dos_attributes/.gitignore b/tests/zfs-tests/cmd/write_dos_attributes/.gitignore
+new file mode 100644
+index 00000000000..f3949ac8282
+--- /dev/null
++++ b/tests/zfs-tests/cmd/write_dos_attributes/.gitignore
+@@ -0,0 +1 @@
++/write_dos_attributes
+diff --git a/tests/zfs-tests/cmd/write_dos_attributes/Makefile.am b/tests/zfs-tests/cmd/write_dos_attributes/Makefile.am
+new file mode 100644
+index 00000000000..c297fd49e0e
+--- /dev/null
++++ b/tests/zfs-tests/cmd/write_dos_attributes/Makefile.am
+@@ -0,0 +1,6 @@
++include $(top_srcdir)/config/Rules.am
++
++pkgexecdir = $(datadir)/@PACKAGE@/zfs-tests/bin
++
++pkgexec_PROGRAMS = write_dos_attributes
++write_dos_attributes_SOURCES = write_dos_attributes.c
+diff --git a/tests/zfs-tests/cmd/write_dos_attributes/write_dos_attributes.c b/tests/zfs-tests/cmd/write_dos_attributes/write_dos_attributes.c
+new file mode 100644
+index 00000000000..c373d3b1531
+--- /dev/null
++++ b/tests/zfs-tests/cmd/write_dos_attributes/write_dos_attributes.c
+@@ -0,0 +1,201 @@
++/*
++ * This file and its contents are supplied under the terms of the
++ * Common Development and Distribution License ("CDDL"), version 1.0.
++ * You may only use this file in accordance with the terms of version
++ * 1.0 of the CDDL.
++ *
++ * A full copy of the text of the CDDL should have accompanied this
++ * source.  A copy of the CDDL is also available via the Internet at
++ * http://www.illumos.org/license/CDDL.
++ */
++
++/*
++ * Copyright 2022 iXsystems, Inc.
++ */
++
++/*
++ * FreeBSD allows to update and retreive additional file level attributes.
++ * For Linux, two IOCTLs have been added to update and retrieve additional
++ * level attributes.
++ *
++ * This application updates additional file level attributes on a given
++ * file. FreeBSD keywords can be used to specify the flag.
++ *
++ * Usage: 'write_dos_attributes flag filepath'
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <err.h>
++#include <sys/fs/zfs.h>
++#include <string.h>
++#include <ctype.h>
++
++#define	SU_ARCH_SHORT				"arch"
++#define	SU_ARCH_FULL				"archived"
++#define	SU_NODUMP				"nodump"
++#define	SU_APPEND_SHORT				"sappnd"
++#define	SU_APPEND_FULL				"sappend"
++#define	SU_IMMUTABLE				"schg"
++#define	SU_IMMUTABLE_SHORT			"schange"
++#define	SU_IMMUTABLE_FULL			"simmutable"
++#define	SU_UNLINK_SHORT				"sunlnk"
++#define	SU_UNLINK_FULL				"sunlink"
++#define	U_APPEND_SHORT				"uappnd"
++#define	U_APPEND_FULL				"uappend"
++#define	U_ARCH_SHORT				"uarch"
++#define	U_ARCH_FULL				"uarchive"
++#define	U_IMMUTABLE				"uchg"
++#define	U_IMMUTABLE_SHORT			"uchange"
++#define	U_IMMUTABLE_FULL			"uimmutable"
++#define	U_HIDDEN_SHORT				"hidden"
++#define	U_HIDDEN_FULL				"uhidden"
++#define	U_OFFLINE_SHORT				"offline"
++#define	U_OFFLINE_FULL				"uoffline"
++#define	U_RDONLY				"rdonly"
++#define	U_RDONLY_SHORT				"urdonly"
++#define	U_RDONLY_FULL				"readonly"
++#define	U_SPARSE_SHORT				"sparse"
++#define	U_SPARSE_FULL				"usparse"
++#define	U_SYSTEM_SHORT				"system"
++#define	U_SYSTEM_FULL				"usystem"
++#define	U_REPARSE_SHORT				"reparse"
++#define	U_REPARSE_FULL				"ureparse"
++#define	U_UNLINK_SHORT				"uunlnk"
++#define	U_UNLINK_FULL				"uunlink"
++#define	UNSET_NODUMP				"dump"
++
++#define	IS_NO(s)	(s[0] == 'n' && s[1] == 'o')
++
++uint64_t str_to_attribute(char *str);
++
++uint64_t
++str_to_attribute(char *str)
++{
++	if ((strcmp(str, SU_ARCH_SHORT) == 0) ||
++	    (strcmp(str, SU_ARCH_FULL) == 0) ||
++	    (strcmp(str, U_ARCH_SHORT) == 0) ||
++	    (strcmp(str, U_ARCH_FULL) == 0))
++		return (ZFS_ARCHIVE);
++
++	else if ((strcmp(str, SU_APPEND_SHORT) == 0) ||
++	    (strcmp(str, SU_APPEND_FULL) == 0) ||
++	    (strcmp(str, U_APPEND_SHORT) == 0) ||
++	    (strcmp(str, U_APPEND_FULL) == 0))
++		return (ZFS_APPENDONLY);
++
++	else if ((strcmp(str, SU_IMMUTABLE) == 0) ||
++	    (strcmp(str, SU_IMMUTABLE_SHORT) == 0) ||
++	    (strcmp(str, SU_IMMUTABLE_FULL) == 0))
++		return (ZFS_IMMUTABLE);
++
++	else if ((strcmp(str, SU_UNLINK_SHORT) == 0) ||
++	    (strcmp(str, SU_UNLINK_FULL) == 0) ||
++	    (strcmp(str, U_UNLINK_SHORT) == 0) ||
++	    (strcmp(str, SU_UNLINK_FULL) == 0))
++		return (ZFS_NOUNLINK);
++
++	else if ((strcmp(str, U_HIDDEN_SHORT) == 0) ||
++	    (strcmp(str, U_HIDDEN_FULL) == 0))
++		return (ZFS_HIDDEN);
++
++	else if ((strcmp(str, U_OFFLINE_SHORT) == 0) ||
++	    (strcmp(str, U_OFFLINE_FULL) == 0))
++		return (ZFS_OFFLINE);
++
++	else if ((strcmp(str, U_RDONLY) == 0) ||
++	    (strcmp(str, U_RDONLY_SHORT) == 0) ||
++	    (strcmp(str, U_RDONLY_FULL) == 0))
++		return (ZFS_READONLY);
++
++	else if ((strcmp(str, U_SPARSE_SHORT) == 0) ||
++	    (strcmp(str, U_SPARSE_FULL) == 0))
++		return (ZFS_SPARSE);
++
++	else if ((strcmp(str, U_SYSTEM_SHORT) == 0) ||
++	    (strcmp(str, U_SYSTEM_FULL) == 0))
++		return (ZFS_SYSTEM);
++
++	else if ((strcmp(str, U_REPARSE_SHORT) == 0) ||
++	    (strcmp(str, U_REPARSE_FULL) == 0))
++		return (ZFS_REPARSE);
++
++	return (-1);
++}
++
++int
++main(int argc, const char * const argv[])
++{
++	if (argc != 3)
++		errx(EXIT_FAILURE, "Usage: %s flag filepath", argv[0]);
++
++	uint8_t unset, unset_all;
++	uint64_t attribute, dosflags;
++	char *flag = strdup(argv[1]);
++	unset = unset_all = 0;
++	attribute = dosflags = 0;
++
++	// convert the flag to lower case
++	for (int i = 0; i < strlen(argv[1]); ++i)
++		flag[i] = tolower((unsigned char) flag[i]);
++
++	// check if flag starts with 'no'
++	if (IS_NO(flag)) {
++		if (strcmp(flag, SU_NODUMP) == 0) {
++			attribute = ZFS_NODUMP;
++		} else {
++			attribute = str_to_attribute(flag + 2);
++			unset = 1;
++		}
++	}
++	// check if '0' was passed
++	else if (strcmp(flag, "0") == 0) {
++		unset_all = 1;
++	}
++	// check if the flag is 'dump'
++	else if (strcmp(flag, UNSET_NODUMP) == 0) {
++		attribute = ZFS_NODUMP;
++		unset = 1;
++	} else {
++		attribute = str_to_attribute(flag);
++	}
++
++	if (attribute == -1)
++		errx(EXIT_FAILURE, "Invalid Flag %s", argv[1]);
++
++	int fd = open(argv[2], O_RDWR | O_APPEND);
++	if (fd < 0)
++		err(EXIT_FAILURE, "Failed to open %s", argv[2]);
++
++	if (ioctl(fd, ZFS_IOC_GETDOSFLAGS, &dosflags) == -1)
++		err(EXIT_FAILURE, "ZFS_IOC_GETDOSFLAGS failed");
++
++	if (unset == 0 && attribute != 0)
++		attribute |= dosflags;
++	else if (unset == 1 && attribute != 0)
++		attribute = dosflags & (~attribute);
++	else if (unset_all == 1)
++		attribute = 0;
++
++	// set the attribute/s
++	if (ioctl(fd, ZFS_IOC_SETDOSFLAGS, &attribute) == -1)
++		err(EXIT_FAILURE, "ZFS_IOC_SETDOSFLAGS failed");
++
++	// get the attributes to confirm
++	dosflags = -1;
++	if (ioctl(fd, ZFS_IOC_GETDOSFLAGS, &dosflags) == -1)
++		err(EXIT_FAILURE, "ZFS_IOC_GETDOSFLAGS failed");
++
++	(void) close(fd);
++
++	if (dosflags != attribute)
++		errx(EXIT_FAILURE, "Could not set %s attribute", argv[1]);
++
++	(void) printf("New Dos Flags: 0x%llx\n", (u_longlong_t)dosflags);
++
++	return (EXIT_SUCCESS);
++}
+diff --git a/tests/zfs-tests/include/commands.cfg b/tests/zfs-tests/include/commands.cfg
+index fa3d12d669f..b247a67ff66 100644
+--- a/tests/zfs-tests/include/commands.cfg
++++ b/tests/zfs-tests/include/commands.cfg
+@@ -215,10 +215,12 @@ export ZFSTEST_FILES='badsend
+     randfree_file
+     randwritecomp
+     readmmap
++    read_dos_attributes
+     rename_dir
+     rm_lnkcnt_zero_file
+     send_doall
+     threadsappend
+     user_ns_exec
++    write_dos_attributes
+     xattrtest
+     stride_dd'
+diff --git a/tests/zfs-tests/tests/functional/Makefile.am b/tests/zfs-tests/tests/functional/Makefile.am
+index e71172b8e86..9164650e341 100644
+--- a/tests/zfs-tests/tests/functional/Makefile.am
++++ b/tests/zfs-tests/tests/functional/Makefile.am
+@@ -21,6 +21,7 @@ SUBDIRS = \
+ 	deadman \
+ 	delegate \
+ 	devices \
++	dos_attributes \
+ 	events \
+ 	exec \
+ 	fallocate \
+diff --git a/tests/zfs-tests/tests/functional/acl/off/Makefile.am b/tests/zfs-tests/tests/functional/acl/off/Makefile.am
+index 36aa13dd03f..ae6a9c69d93 100644
+--- a/tests/zfs-tests/tests/functional/acl/off/Makefile.am
++++ b/tests/zfs-tests/tests/functional/acl/off/Makefile.am
+@@ -10,7 +10,5 @@ dist_pkgdata_SCRIPTS = \
+ 
+ pkgexecdir = $(datadir)/@PACKAGE@/zfs-tests/tests/functional/acl/off
+ 
+-if BUILD_FREEBSD
+ pkgexec_PROGRAMS = dosmode_readonly_write
+ dosmode_readonly_write_SOURCES = dosmode_readonly_write.c
+-endif
+diff --git a/tests/zfs-tests/tests/functional/acl/off/dosmode.ksh b/tests/zfs-tests/tests/functional/acl/off/dosmode.ksh
+index e232dfd525c..585aa025390 100755
+--- a/tests/zfs-tests/tests/functional/acl/off/dosmode.ksh
++++ b/tests/zfs-tests/tests/functional/acl/off/dosmode.ksh
+@@ -31,8 +31,6 @@
+ # DESCRIPTION:
+ #	Verify that DOS mode flags function correctly.
+ #
+-#	These flags are not currently exposed on Linux, so the test is
+-#	only useful on FreeBSD.
+ #
+ # STRATEGY:
+ #	1. ARCHIVE
+@@ -56,7 +54,13 @@ function hasflag
+ 	typeset flag=$1
+ 	typeset path=$2
+ 
+-	ls -lo $path | awk '{ gsub(",", "\n", $5); print $5 }' | grep -qxF $flag
++	if is_linux; then
++		read_dos_attributes $path | awk \
++		'{ gsub(",", "\n", $1); print $1 }' | grep -qxF $flag
++	else
++		ls -lo $path | awk '{ gsub(",", "\n", $5); print $5 }' | \
++		grep -qxF $flag
++	fi
+ }
+ 
+ log_assert "Verify DOS mode flags function correctly"
+@@ -67,6 +71,12 @@ testfile=$TESTDIR/testfile
+ owner=$ZFS_ACL_STAFF1
+ other=$ZFS_ACL_STAFF2
+ 
++if is_linux; then
++	changeflags=write_dos_attributes
++else
++	changeflags=chflags
++fi
++
+ #
+ # ARCHIVE
+ #
+@@ -75,36 +85,40 @@ other=$ZFS_ACL_STAFF2
+ #
+ log_must touch $testfile
+ log_must hasflag uarch $testfile
+-log_must chflags nouarch $testfile
++log_must $changeflags nouarch $testfile
+ log_must hasflag - $testfile
+ log_must touch $testfile
+-log_must hasflag uarch $testfile
++if ! is_linux; then
++	log_must hasflag uarch $testfile
++fi
+ log_must rm $testfile
+ log_must user_run $owner touch $testfile
+ log_must hasflag uarch $testfile
+-log_must user_run $owner chflags nouarch $testfile
+-log_mustnot user_run $other chflags uarch $testfile
++log_must user_run $owner $changeflags nouarch $testfile
++log_mustnot user_run $other $changeflags uarch $testfile
+ log_must hasflag - $testfile
+ log_must user_run $owner touch $testfile
+-log_mustnot user_run $other chflags nouarch $testfile
+-log_must hasflag uarch $testfile
++log_mustnot user_run $other $changeflags nouarch $testfile
++if ! is_linux; then
++	log_must hasflag uarch $testfile
++fi
+ log_must user_run $owner rm $testfile
+ 
+ #
+ # HIDDEN
+ #
+ log_must touch $testfile
+-log_must chflags hidden $testfile
++log_must $changeflags hidden $testfile
+ log_must hasflag hidden $testfile
+-log_must chflags 0 $testfile
++log_must $changeflags 0 $testfile
+ log_must hasflag - $testfile
+ log_must rm $testfile
+ log_must user_run $owner touch $testfile
+-log_must user_run $owner chflags hidden $testfile
+-log_mustnot user_run $other chflags nohidden $testfile
++log_must user_run $owner $changeflags hidden $testfile
++log_mustnot user_run $other $changeflags nohidden $testfile
+ log_must hasflag hidden $testfile
+-log_must user_run $owner chflags 0 $testfile
+-log_mustnot user_run $other chflags hidden $testfile
++log_must user_run $owner $changeflags 0 $testfile
++log_mustnot user_run $other $changeflags hidden $testfile
+ log_must hasflag - $testfile
+ log_must user_run $owner rm $testfile
+ 
+@@ -113,17 +127,17 @@ log_must user_run $owner rm $testfile
+ # OFFLINE
+ #
+ log_must touch $testfile
+-log_must chflags offline $testfile
++log_must $changeflags offline $testfile
+ log_must hasflag offline $testfile
+-log_must chflags 0 $testfile
++log_must $changeflags 0 $testfile
+ log_must hasflag - $testfile
+ log_must rm $testfile
+ log_must user_run $owner touch $testfile
+-log_must user_run $owner chflags offline $testfile
+-log_mustnot user_run $other chflags nooffline $testfile
++log_must user_run $owner $changeflags offline $testfile
++log_mustnot user_run $other $changeflags nooffline $testfile
+ log_must hasflag offline $testfile
+-log_must user_run $owner chflags 0 $testfile
+-log_mustnot user_run $other chflags offline $testfile
++log_must user_run $owner $changeflags 0 $testfile
++log_mustnot user_run $other $changeflags offline $testfile
+ log_must hasflag - $testfile
+ log_must user_run $owner rm $testfile
+ 
+@@ -134,21 +148,23 @@ log_must user_run $owner rm $testfile
+ # but root is always allowed the operation.
+ #
+ log_must touch $testfile
+-log_must chflags rdonly $testfile
++log_must $changeflags rdonly $testfile
+ log_must hasflag rdonly $testfile
+ log_must eval "echo 'root write allowed' >> $testfile"
+ log_must cat $testfile
+-log_must chflags 0 $testfile
+-log_must hasflag - $tesfile
++log_must $changeflags 0 $testfile
++log_must hasflag - $testfile
+ log_must rm $testfile
+ # It is required to still be able to write to an fd that was opened RW before
+ # READONLY is set.  We have a special test program for that.
+ log_must user_run $owner touch $testfile
+-log_mustnot user_run $other chflags rdonly $testfile
++log_mustnot user_run $other $changeflags rdonly $testfile
+ log_must user_run $owner $tests_base/dosmode_readonly_write $testfile
+-log_mustnot user_run $other chflags nordonly $testfile
++log_mustnot user_run $other $changeflags nordonly $testfile
+ log_must hasflag rdonly $testfile
+-log_mustnot user_run $owner "echo 'user write forbidden' >> $testfile"
++if ! is_linux; then
++	log_mustnot user_run $owner "echo 'user write forbidden' >> $testfile"
++fi
+ log_must eval "echo 'root write allowed' >> $testfile"
+ # We are still allowed to read and remove the file when READONLY is set.
+ log_must user_run $owner cat $testfile
+@@ -157,24 +173,23 @@ log_must user_run $owner rm $testfile
+ #
+ # REPARSE
+ #
+-# FIXME: does not work, not sure if broken or testing wrong
+-#
++# not allowed to be changed
+ 
+ #
+ # SPARSE
+ #
+ log_must truncate -s 1m $testfile
+-log_must chflags sparse $testfile
++log_must $changeflags sparse $testfile
+ log_must hasflag sparse $testfile
+-log_must chflags 0 $testfile
++log_must $changeflags 0 $testfile
+ log_must hasflag - $testfile
+ log_must rm $testfile
+ log_must user_run $owner truncate -s 1m $testfile
+-log_must user_run $owner chflags sparse $testfile
+-log_mustnot user_run $other chflags nosparse $testfile
++log_must user_run $owner $changeflags sparse $testfile
++log_mustnot user_run $other $changeflags nosparse $testfile
+ log_must hasflag sparse $testfile
+-log_must user_run $owner chflags 0 $testfile
+-log_mustnot user_run $other chflags sparse $testfile
++log_must user_run $owner $changeflags 0 $testfile
++log_mustnot user_run $other $changeflags sparse $testfile
+ log_must hasflag - $testfile
+ log_must user_run $owner rm $testfile
+ 
+@@ -182,17 +197,17 @@ log_must user_run $owner rm $testfile
+ # SYSTEM
+ #
+ log_must touch $testfile
+-log_must chflags system $testfile
++log_must $changeflags system $testfile
+ log_must hasflag system $testfile
+-log_must chflags 0 $testfile
++log_must $changeflags 0 $testfile
+ log_must hasflag - $testfile
+ log_must rm $testfile
+ log_must user_run $owner touch $testfile
+-log_must user_run $owner chflags system $testfile
+-log_mustnot user_run $other chflags nosystem $testfile
++log_must user_run $owner $changeflags system $testfile
++log_mustnot user_run $other $changeflags nosystem $testfile
+ log_must hasflag system $testfile
+-log_must user_run $owner chflags 0 $testfile
+-log_mustnot user_run $other chflags system $testfile
++log_must user_run $owner $changeflags 0 $testfile
++log_mustnot user_run $other $changeflags system $testfile
+ log_must hasflag - $testfile
+ log_must user_run $owner rm $testfile
+ 
+diff --git a/tests/zfs-tests/tests/functional/acl/off/dosmode_readonly_write.c b/tests/zfs-tests/tests/functional/acl/off/dosmode_readonly_write.c
+index 372c3f7f64d..0441d1c7b47 100644
+--- a/tests/zfs-tests/tests/functional/acl/off/dosmode_readonly_write.c
++++ b/tests/zfs-tests/tests/functional/acl/off/dosmode_readonly_write.c
+@@ -36,6 +36,11 @@
+ #include <string.h>
+ #include <unistd.h>
+ 
++#ifdef __linux__
++#include <stdint.h>
++#include <sys/fs/zfs.h>
++#endif
++
+ int
+ main(int argc, const char *argv[])
+ {
+@@ -51,8 +56,14 @@ main(int argc, const char *argv[])
+ 	fd = open(path, O_CREAT|O_RDWR, 0777);
+ 	if (fd == -1)
+ 		err(EXIT_FAILURE, "%s: open failed", path);
++#ifdef __linux__
++	uint64_t dosflags = ZFS_READONLY;
++	if (ioctl(fd, ZFS_IOC_SETDOSFLAGS, &dosflags) == -1)
++		err(EXIT_FAILURE, "%s: ZFS_IOC_SETDOSFLAGS failed", path);
++#else
+ 	if (chflags(path, UF_READONLY) == -1)
+ 		err(EXIT_FAILURE, "%s: chflags failed", path);
++#endif
+ 	if (write(fd, buf, strlen(buf)) == -1)
+ 		err(EXIT_FAILURE, "%s: write failed", path);
+ 	if (close(fd) == -1)
+diff --git a/tests/zfs-tests/tests/functional/dos_attributes/Makefile.am b/tests/zfs-tests/tests/functional/dos_attributes/Makefile.am
+new file mode 100644
+index 00000000000..436bcdb1f31
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/dos_attributes/Makefile.am
+@@ -0,0 +1,8 @@
++include $(top_srcdir)/config/Rules.am
++
++pkgdatadir = $(datadir)/@PACKAGE@/zfs-tests/tests/functional/dos_attributes
++dist_pkgdata_SCRIPTS = \
++    cleanup.ksh \
++    read_dos_attrs_001.ksh \
++    write_dos_attrs_001.ksh \
++    setup.ksh
+diff --git a/tests/zfs-tests/tests/functional/dos_attributes/cleanup.ksh b/tests/zfs-tests/tests/functional/dos_attributes/cleanup.ksh
+new file mode 100755
+index 00000000000..3166bd6ec16
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/dos_attributes/cleanup.ksh
+@@ -0,0 +1,34 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or http://www.opensolaris.org/os/licensing.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++#
++# Copyright 2007 Sun Microsystems, Inc.  All rights reserved.
++# Use is subject to license terms.
++#
++
++#
++# Copyright (c) 2013 by Delphix. All rights reserved.
++#
++
++. $STF_SUITE/include/libtest.shlib
++
++default_cleanup
+diff --git a/tests/zfs-tests/tests/functional/dos_attributes/read_dos_attrs_001.ksh b/tests/zfs-tests/tests/functional/dos_attributes/read_dos_attrs_001.ksh
+new file mode 100755
+index 00000000000..c36c0183315
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/dos_attributes/read_dos_attrs_001.ksh
+@@ -0,0 +1,60 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or http://www.opensolaris.org/os/licensing.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++#
++# Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
++# Use is subject to license terms.
++#
++
++#
++# Copyright (c) 2013, 2016 by Delphix. All rights reserved.
++#
++
++. $STF_SUITE/include/libtest.shlib
++
++#
++# DESCRIPTION:
++#
++# Read additional file level attributes stored in upper half of z_pflags
++#
++# STARTEGY:
++#		1) Create a file
++#		2) Execute read_dos_attributes on the file we created
++#		3) Verify that read_dos_attributes exited successfully
++#
++
++verify_runnable "global"
++
++FILETOTEST="$TESTDIR/test_read_dos_attrs.txt"
++
++function cleanup
++{
++	rm -f $FILETOTEST
++}
++
++log_onexit cleanup
++
++log_must chmod 777 $TESTDIR
++log_must eval "echo 'This is a test file.' > $FILETOTEST"
++log_must read_dos_attributes $FILETOTEST
++
++log_pass "reading DOS attributes succeeded."
+diff --git a/tests/zfs-tests/tests/functional/dos_attributes/setup.ksh b/tests/zfs-tests/tests/functional/dos_attributes/setup.ksh
+new file mode 100755
+index 00000000000..fc5cec3063a
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/dos_attributes/setup.ksh
+@@ -0,0 +1,35 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or http://www.opensolaris.org/os/licensing.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++#
++# Copyright 2007 Sun Microsystems, Inc.  All rights reserved.
++# Use is subject to license terms.
++#
++
++#
++# Copyright (c) 2013 by Delphix. All rights reserved.
++#
++
++. $STF_SUITE/include/libtest.shlib
++
++DISK=${DISKS%% *}
++default_setup $DISK
+diff --git a/tests/zfs-tests/tests/functional/dos_attributes/write_dos_attrs_001.ksh b/tests/zfs-tests/tests/functional/dos_attributes/write_dos_attrs_001.ksh
+new file mode 100755
+index 00000000000..9d66cd35759
+--- /dev/null
++++ b/tests/zfs-tests/tests/functional/dos_attributes/write_dos_attrs_001.ksh
+@@ -0,0 +1,61 @@
++#!/bin/ksh -p
++#
++# CDDL HEADER START
++#
++# The contents of this file are subject to the terms of the
++# Common Development and Distribution License (the "License").
++# You may not use this file except in compliance with the License.
++#
++# You can obtain a copy of the license at usr/src/OPENSOLARIS.LICENSE
++# or http://www.opensolaris.org/os/licensing.
++# See the License for the specific language governing permissions
++# and limitations under the License.
++#
++# When distributing Covered Code, include this CDDL HEADER in each
++# file and include the License file at usr/src/OPENSOLARIS.LICENSE.
++# If applicable, add the following below this CDDL HEADER, with the
++# fields enclosed by brackets "[]" replaced with your own identifying
++# information: Portions Copyright [yyyy] [name of copyright owner]
++#
++# CDDL HEADER END
++#
++
++#
++# Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
++# Use is subject to license terms.
++#
++
++#
++# Copyright (c) 2013, 2016 by Delphix. All rights reserved.
++#
++
++. $STF_SUITE/include/libtest.shlib
++
++#
++# DESCRIPTION:
++#
++# Write additional file level attributes stored in upper half of z_pflags
++#
++# STARTEGY:
++#		1) Create a file
++#		2) Execute write_dos_attributes on the file we created
++#		3) Verify that write_dos_attributes exited successfully
++#
++
++verify_runnable "global"
++
++FILETOTEST="$TESTDIR/test_write_dos_attrs.txt"
++
++function cleanup
++{
++	rm -f $FILETOTEST
++}
++
++log_onexit cleanup
++
++log_must chmod 777 $TESTDIR
++log_must eval "echo 'This is a test file.' > $FILETOTEST"
++log_must write_dos_attributes offline $FILETOTEST
++log_must write_dos_attributes nooffline $FILETOTEST
++
++log_pass "writing DOS attributes succeeded."

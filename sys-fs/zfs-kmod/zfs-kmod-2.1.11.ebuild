@@ -60,6 +60,27 @@ RESTRICT="debug? ( strip ) test"
 
 DOCS=( AUTHORS COPYRIGHT META README.md )
 
+PATCHES=(
+       # Prerequisite to idmap patch: "Use generic_permission() on Linux if ACL is trivial"
+       # https://github.com/openzfs/zfs/pull/13237
+       "${FILESDIR}"/2.1.11-optimize-access-checks.patch
+       # Prerequesite to idmap patch: "Expose additional file level attributes"
+       # https://github.com/openzfs/zfs/pull/13118
+       "${FILESDIR}"/2.1.11-expose-additional-attributes.patch
+       # Backported version of "Support idmapped mount"
+       # https://github.com/openzfs/zfs/pull/13671
+       "${FILESDIR}"/2.1.11-support-idmapped-mount.patch
+       # Backported version of "Support idmapped mount in user namespace"
+       # https://github.com/openzfs/zfs/pull/14097
+       "${FILESDIR}"/2.1.11-support-idmapped-mount-in-user-ns.patch
+       # Backported version of "Linux 6.3 compat: idmapped mount API changes"
+       # https://github.com/openzfs/zfs/pull/14682
+       "${FILESDIR}"/2.1.11-6.3-compat-idmapped-mount-api-changes.patch
+       # "Linux 6.3 compat: writepage_t first arg struct folio*"
+       # https://github.com/openzfs/zfs/pull/14699
+       "${FILESDIR}"/2.1.11-6.3-compat-writepage_t-typedef-change.patch
+)
+
 pkg_pretend() {
 	use rootfs || return 0
 
