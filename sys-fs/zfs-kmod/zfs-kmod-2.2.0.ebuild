@@ -8,7 +8,7 @@ inherit autotools dist-kernel-utils flag-o-matic linux-mod-r1 multiprocessing
 DESCRIPTION="Linux ZFS kernel module for sys-fs/zfs"
 HOMEPAGE="https://github.com/openzfs/zfs"
 
-MODULES_KERNEL_MAX=6.5
+MODULES_KERNEL_MAX=6.6
 MODULES_KERNEL_MIN=3.10
 
 if [[ ${PV} == 9999 ]] ; then
@@ -16,7 +16,7 @@ if [[ ${PV} == 9999 ]] ; then
 	inherit git-r3
 	unset MODULES_KERNEL_MAX
 else
-	VERIFY_SIG_OPENPGP_KEY_PATH="${BROOT}"/usr/share/openpgp-keys/openzfs.asc
+	VERIFY_SIG_OPENPGP_KEY_PATH=/usr/share/openpgp-keys/openzfs.asc
 	inherit verify-sig
 
 	MY_PV=${PV/_rc/-rc}
@@ -60,6 +60,9 @@ PDEPEND="dist-kernel? ( ~sys-fs/zfs-${PV}[dist-kernel] )"
 
 PATCHES=(
 	"${FILESDIR}"/${PN}-2.1.11-gentoo.patch
+	"${FILESDIR}"/${PN}-2.2.0-linux-6.6-ctime.patch
+	"${FILESDIR}"/${PN}-2.2.0-linux-6.6-fsync.patch
+	"${FILESDIR}"/${PN}-2.2.0-linux-6.6-fillattr.patch
 )
 
 pkg_pretend() {
