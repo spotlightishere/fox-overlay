@@ -1,4 +1,4 @@
-# Copyright 1999-2023 Gentoo Authors
+# Copyright 1999-2024 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 EAPI=8
@@ -8,31 +8,19 @@ inherit autotools dist-kernel-utils flag-o-matic linux-mod-r1 multiprocessing
 DESCRIPTION="Linux ZFS kernel module for sys-fs/zfs"
 HOMEPAGE="https://github.com/openzfs/zfs"
 
-MODULES_KERNEL_MAX=6.6
+MODULES_KERNEL_MAX=6.7
 MODULES_KERNEL_MIN=3.10
 
-if [[ ${PV} == 9999 ]] ; then
-	EGIT_REPO_URI="https://github.com/openzfs/zfs.git"
-	inherit git-r3
-	unset MODULES_KERNEL_MAX
-else
-	VERIFY_SIG_OPENPGP_KEY_PATH=/usr/share/openpgp-keys/openzfs.asc
-	inherit verify-sig
+EGIT_REPO_URI="https://github.com/openzfs/zfs.git"
+EGIT_BRANCH="zfs-2.2.3-staging"
+inherit git-r3
 
-	MY_PV=${PV/_rc/-rc}
-	SRC_URI="https://github.com/openzfs/zfs/releases/download/zfs-${MY_PV}/zfs-${MY_PV}.tar.gz"
-	SRC_URI+=" verify-sig? ( https://github.com/openzfs/zfs/releases/download/zfs-${MY_PV}/zfs-${MY_PV}.tar.gz.asc )"
-	S="${WORKDIR}/zfs-${MY_PV}"
+ZFS_KERNEL_COMPAT="${MODULES_KERNEL_MAX}"
+# Increments minor eg 5.14 -> 5.15, and still supports override.
+ZFS_KERNEL_DEP="${ZFS_KERNEL_COMPAT_OVERRIDE:-${ZFS_KERNEL_COMPAT}}"
+ZFS_KERNEL_DEP="${ZFS_KERNEL_DEP%%.*}.$(( ${ZFS_KERNEL_DEP##*.} + 1))"
 
-	ZFS_KERNEL_COMPAT="${MODULES_KERNEL_MAX}"
-	# Increments minor eg 5.14 -> 5.15, and still supports override.
-	ZFS_KERNEL_DEP="${ZFS_KERNEL_COMPAT_OVERRIDE:-${ZFS_KERNEL_COMPAT}}"
-	ZFS_KERNEL_DEP="${ZFS_KERNEL_DEP%%.*}.$(( ${ZFS_KERNEL_DEP##*.} + 1))"
-
-	if [[ ${PV} != *_rc* ]] ; then
-		KEYWORDS="~amd64 ~arm64 ~ppc64 ~riscv ~sparc"
-	fi
-fi
+KEYWORDS="~amd64 ~arm64 ~loong ~ppc64 ~riscv ~sparc"
 
 LICENSE="CDDL MIT debug? ( GPL-2+ )"
 SLOT="0/${PVR}"
@@ -45,8 +33,6 @@ BDEPEND="
 "
 
 if [[ ${PV} != 9999 ]] ; then
-	BDEPEND+=" verify-sig? ( sec-keys/openpgp-keys-openzfs )"
-
 	IUSE+=" +dist-kernel-cap"
 	RDEPEND="
 		dist-kernel-cap? ( dist-kernel? (
