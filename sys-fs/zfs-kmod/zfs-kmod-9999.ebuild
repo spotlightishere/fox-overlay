@@ -1,4 +1,4 @@
-# Copyright 1999-2023 Gentoo Authors
+# Copyright 1999-2024 Gentoo Authors
 # Distributed under the terms of the GNU General Public License v2
 
 EAPI=8
@@ -8,7 +8,7 @@ inherit autotools dist-kernel-utils flag-o-matic linux-mod-r1 multiprocessing
 DESCRIPTION="Linux ZFS kernel module for sys-fs/zfs"
 HOMEPAGE="https://github.com/openzfs/zfs"
 
-MODULES_KERNEL_MAX=6.6
+MODULES_KERNEL_MAX=6.7
 MODULES_KERNEL_MIN=3.10
 
 if [[ ${PV} == 9999 ]] ; then
