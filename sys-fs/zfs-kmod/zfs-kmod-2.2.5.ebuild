@@ -61,10 +61,6 @@ PDEPEND="dist-kernel? ( ~sys-fs/zfs-${PV}[dist-kernel] )"
 
 PATCHES=(
 	"${FILESDIR}"/${PN}-2.1.11-gentoo.patch
-  # Linux 6.10.x compatibility: https://github.com/openzfs/zfs/pull/16250
-  "${FILESDIR}"/7ca7bb7fd723a91366ce767aea53c4f5c2d65afb.patch
-  "${FILESDIR}"/e951dba48a6330aca9c161c50189f6974e6877f0.patch
-  "${FILESDIR}"/b409892ae5028965a6fe98dde1346594807e6e45.patch
 )
 
 pkg_pretend() {
